@@ -1574,6 +1574,8 @@ public static class Gen5ShaderScalarEvaluator
             "SBrevB32" or
             "SBcnt1I32B32" or
             "SFF1I32B32" or
+            "SFlbitI32B32" or
+            "SAbsI32" or
             "SBitset1B32")
         {
             registers[destination.Value] = instruction.Opcode switch
@@ -1582,13 +1584,40 @@ public static class Gen5ShaderScalarEvaluator
                 "SBrevB32" => ReverseBits(left),
                 "SBcnt1I32B32" => (uint)BitOperations.PopCount(left),
                 "SFF1I32B32" => left == 0 ? uint.MaxValue : (uint)BitOperations.TrailingZeroCount(left),
-                _ => registers[destination.Value] | (1u << ((int)left & 31)),
+                "SFlbitI32B32" => left == 0 ? uint.MaxValue : (uint)BitOperations.LeadingZeroCount(left),
+                "SAbsI32" => (left & 0x8000_0000u) == 0 ? left : ~left + 1u,
+                "SBitset1B32" => registers[destination.Value] | (1u << ((int)left & 31)),
+                _ => registers[destination.Value],
             };
             if (instruction.Opcode != "SBitset1B32")
             {
                 scalarConditionCode = registers[destination.Value] != 0;
             }
 
+            return true;
+        }
+
+        // These single-source operations read a scalar register pair but write
+        // a 32-bit result. They must not fall through to the two-source path.
+        if (instruction.Opcode is "SFF1I32B64" or "SBcnt1I32B64")
+        {
+            if (!TryEvaluateScalarOperand64(
+                    instruction.Sources[0],
+                    registers,
+                    execMask,
+                    out var pairValue))
+            {
+                error = $"scalar-source64 pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+                return false;
+            }
+
+            var pairResult = instruction.Opcode == "SBcnt1I32B64"
+                ? (uint)BitOperations.PopCount(pairValue)
+                : pairValue == 0
+                    ? uint.MaxValue
+                    : (uint)BitOperations.TrailingZeroCount(pairValue);
+            registers[destination.Value] = pairResult;
+            scalarConditionCode = pairResult != 0;
             return true;
         }
 
