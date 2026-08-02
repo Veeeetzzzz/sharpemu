@@ -864,8 +864,8 @@ public static class SaveDataExports
     {
         // Demon's Souls first-run call:
         // RDI = 0xC0000, RSI = RDX + 8, RDX = resource output.
-        // Writing integer handle 1 makes the title dereference [1 + 8],
-        // causing the repeatable access violation at guest address 0x9.
+        // The title expects a self-referential resource handle and then
+        // dereferences [resource + 8] as the work address.
         var desWorkSize = ctx[CpuRegister.Rdi];
         var desWorkAddress = ctx[CpuRegister.Rsi];
         var desResourceAddress = ctx[CpuRegister.Rdx];
@@ -875,7 +875,7 @@ public static class SaveDataExports
             desResourceAddress <= ulong.MaxValue - sizeof(ulong) &&
             desWorkAddress == desResourceAddress + sizeof(ulong))
         {
-            if (!ctx.TryWriteUInt64(desResourceAddress, 0))
+            if (!ctx.TryWriteUInt64(desResourceAddress, desResourceAddress))
             {
                 return SetReturn(
                     ctx,
@@ -886,7 +886,7 @@ public static class SaveDataExports
                 $"create_transaction_resource_des_guard " +
                 $"work_size=0x{desWorkSize:X} " +
                 $"work=0x{desWorkAddress:X} " +
-                $"resource_addr=0x{desResourceAddress:X} resource=0x0");
+                $"resource_addr=0x{desResourceAddress:X} resource=0x{desResourceAddress:X}");
 
             return SetReturn(ctx, 0);
         }

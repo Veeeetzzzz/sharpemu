@@ -111,6 +111,10 @@ release includes the MoltenVK Vulkan implementation.
 4. Build the project: `dotnet build` or `dotnet publish`
 5. Build artifacts will be located in the `artifacts` directory.
 
+Visual Studio is not required: the supported .NET SDK and the `dotnet` CLI are
+enough to build the solution. The generated aerolib MSBuild task explicitly
+selects the .NET task host so clean builds also work with the .NET 10 SDK.
+
 ## Disclaimer
 
 SharpEmu is an experimental emulator intended for research and educational purposes.
