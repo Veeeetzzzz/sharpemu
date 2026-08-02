@@ -20,6 +20,13 @@ dialog. This avoids the title rejecting a result because it never observed a
 live dialog, or reopening a dialog forever after echoing the header size as the
 mode.
 
+The guarded `sceSaveDataCreateTransactionResource` call used by this title also
+returns a self-referential resource handle: the output points at its own
+address, so the game's follow-up read at `resource + 8` reaches the supplied
+work address. The contract is covered by
+`CreateTransactionResource_DesGuardReturnsSelfReferentialHandle` and follows
+the narrow ABI fix described in upstream [#702](https://github.com/sharpemu/sharpemu/pull/702).
+
 The behavior is based on the Demon's Souls-specific evidence and regression
 tests in upstream [#730](https://github.com/sharpemu/sharpemu/pull/730), while
 leaving its unrelated GUI and stale-base renderer changes out of this
