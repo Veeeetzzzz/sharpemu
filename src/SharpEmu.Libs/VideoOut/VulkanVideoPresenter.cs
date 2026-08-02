@@ -242,6 +242,23 @@ internal static unsafe class VulkanVideoPresenter
                abandonedCount < maximumInFlight - pendingCount;
     }
 
+    /// <summary>
+    /// Decides whether a render tick that already completed guest work may
+    /// wait briefly for the producer to enqueue its dependent work. The wait
+    /// is bounded by both the per-tick follow-up budget and the normal render
+    /// budget; a tick that has not completed any work never parks.
+    /// </summary>
+    internal static bool ShouldWaitForGuestWorkFollowup(
+        int completedWork,
+        int waitMilliseconds,
+        long nowTicks,
+        long followupDeadline,
+        long renderDeadline) =>
+        completedWork > 0 &&
+        waitMilliseconds > 0 &&
+        nowTicks < followupDeadline &&
+        nowTicks < renderDeadline;
+
     internal static uint GetGuestTextureDepth(uint type, uint depth) =>
         IsGuestTexture3D(type) ? Math.Max(depth, 1u) : 1u;
 
@@ -542,6 +559,26 @@ internal static unsafe class VulkanVideoPresenter
              out var renderBudgetMs) && renderBudgetMs >= 0
             ? renderBudgetMs
             : OperatingSystem.IsMacOS() ? 12L : 0L) *
+        System.Diagnostics.Stopwatch.Frequency / 1000L;
+    // The guest producer and presenter run on separate threads. A render tick
+    // can drain the current queue just before the producer publishes the next
+    // draw/flip, causing the presenter to sample an older image and remain on
+    // a black or splash frame for another tick. A short condition-variable
+    // probe closes that hand-off race without turning Render into an unbounded
+    // wait. SHARPEMU_RENDER_FOLLOWUP_WAIT_MS and
+    // SHARPEMU_RENDER_FOLLOWUP_BUDGET_MS override the defaults.
+    private static readonly int _guestWorkFollowupWaitMs =
+        int.TryParse(
+            Environment.GetEnvironmentVariable("SHARPEMU_RENDER_FOLLOWUP_WAIT_MS"),
+            out var followupWaitMs) && followupWaitMs >= 0
+            ? followupWaitMs
+            : 2;
+    private static readonly long _guestWorkFollowupBudgetTicks =
+        (long.TryParse(
+             Environment.GetEnvironmentVariable("SHARPEMU_RENDER_FOLLOWUP_BUDGET_MS"),
+             out var followupBudgetMs) && followupBudgetMs >= 0
+            ? followupBudgetMs
+            : 24L) *
         System.Diagnostics.Stopwatch.Frequency / 1000L;
     // Max time the main-thread Render() will block waiting for a frame slot's
     // GPU fence before skipping the frame and returning to the event pump.
@@ -3045,6 +3082,25 @@ internal static unsafe class VulkanVideoPresenter
 
             System.Threading.Monitor.PulseAll(_gate);
             return true;
+        }
+    }
+
+    private static bool WaitForFollowupGuestWork(int timeoutMilliseconds)
+    {
+        lock (_gate)
+        {
+            if (_pendingGuestWorkCount > 0)
+            {
+                return true;
+            }
+
+            if (_closed)
+            {
+                return false;
+            }
+
+            System.Threading.Monitor.Wait(_gate, timeoutMilliseconds);
+            return _pendingGuestWorkCount > 0;
         }
     }
 
@@ -15400,10 +15456,13 @@ internal static unsafe class VulkanVideoPresenter
 
             var completedWork = 0;
             HashSet<string>? deferredOrderedQueues = null;
-            var workBudgetTicks = _renderWorkBudgetTicks;
-            var renderWorkDeadline = workBudgetTicks > 0
-                ? System.Diagnostics.Stopwatch.GetTimestamp() + workBudgetTicks
+            var drainStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            var renderWorkDeadline = _renderWorkBudgetTicks > 0
+                ? drainStartTicks + _renderWorkBudgetTicks
                 : long.MaxValue;
+            var followupDeadline = _guestWorkFollowupBudgetTicks > 0
+                ? drainStartTicks + _guestWorkFollowupBudgetTicks
+                : long.MinValue;
             var workLimit = _maxGuestWorkPerRender;
             // Prefer ordered sync / flip heads while the queue is elevated so
             // label wakeups are not starved behind fat compute/draw items on
@@ -15443,7 +15502,19 @@ internal static unsafe class VulkanVideoPresenter
 
                 if (!tookGuestWork)
                 {
-                    break;
+                    var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                    if (!ShouldWaitForGuestWorkFollowup(
+                            completedWork,
+                            _guestWorkFollowupWaitMs,
+                            nowTicks,
+                            followupDeadline,
+                            renderWorkDeadline) ||
+                        !WaitForFollowupGuestWork(_guestWorkFollowupWaitMs))
+                    {
+                        break;
+                    }
+
+                    continue;
                 }
 
                 if (!string.Equals(
