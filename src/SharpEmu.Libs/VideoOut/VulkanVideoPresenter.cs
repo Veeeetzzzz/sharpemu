@@ -117,6 +117,112 @@ internal static unsafe class VulkanVideoPresenter
     internal static bool IsGuestTexture3D(uint type) =>
         type == Gen5TextureType3D;
 
+    /// <summary>
+    /// Finds changed runs in one mapped writeback page. Dense pages are
+    /// represented by one full-page run; sparse pages use SIMD equality
+    /// skips before the scalar mismatch scan. The returned byte count is
+    /// the total changed-byte count represented by <paramref name="runs"/>.
+    /// </summary>
+    internal static int ScanChangedWritebackRuns(
+        ReadOnlySpan<byte> mapped,
+        ReadOnlySpan<byte> shadow,
+        int absoluteOffset,
+        List<(int Start, int Length)> runs)
+    {
+        if (mapped.Length != shadow.Length)
+        {
+            throw new ArgumentException("Mapped and shadow spans must have the same length.");
+        }
+
+        runs.Clear();
+        if (mapped.Length == 0 || mapped.SequenceEqual(shadow))
+        {
+            return 0;
+        }
+
+        const int coarseBlockSize = 128;
+        var coarseBlockCount = 0;
+        var coarseDiffBlockCount = 0;
+        for (var blockStart = 0; blockStart < mapped.Length; blockStart += coarseBlockSize)
+        {
+            var blockEnd = Math.Min(blockStart + coarseBlockSize, mapped.Length);
+            coarseBlockCount++;
+            if (!mapped.Slice(blockStart, blockEnd - blockStart).SequenceEqual(
+                    shadow.Slice(blockStart, blockEnd - blockStart)))
+            {
+                coarseDiffBlockCount++;
+            }
+        }
+
+        if (coarseDiffBlockCount * 4 >= coarseBlockCount)
+        {
+            runs.Add((absoluteOffset, mapped.Length));
+            return mapped.Length;
+        }
+
+        var changedBytes = 0;
+        var cursor = 0;
+        while (cursor < mapped.Length)
+        {
+            cursor = SkipEqualBytes(mapped, shadow, cursor, mapped.Length);
+            if (cursor == mapped.Length)
+            {
+                break;
+            }
+
+            var runStart = cursor;
+            cursor = SkipDifferentBytes(mapped, shadow, cursor, mapped.Length);
+            var runLength = cursor - runStart;
+            runs.Add((absoluteOffset + runStart, runLength));
+            changedBytes += runLength;
+        }
+
+        return changedBytes;
+    }
+
+    internal static int SkipEqualBytes(
+        ReadOnlySpan<byte> first,
+        ReadOnlySpan<byte> second,
+        int start,
+        int end)
+    {
+        var cursor = start;
+        var vectorSize = Vector<byte>.Count;
+        while (cursor + vectorSize <= end)
+        {
+            var left = new Vector<byte>(first.Slice(cursor, vectorSize));
+            var right = new Vector<byte>(second.Slice(cursor, vectorSize));
+            if (left != right)
+            {
+                break;
+            }
+
+            cursor += vectorSize;
+        }
+
+        while (cursor < end && first[cursor] == second[cursor])
+        {
+            cursor++;
+        }
+
+        return cursor;
+    }
+
+    internal static int SkipDifferentBytes(
+        ReadOnlySpan<byte> first,
+        ReadOnlySpan<byte> second,
+        int start,
+        int end)
+    {
+        var cursor = start;
+        while (cursor < end && first[cursor] != second[cursor])
+        {
+            cursor++;
+        }
+
+        return cursor;
+    }
+
     internal static bool HasGuestSubmissionCapacity(
         int pendingCount,
         int abandonedCount,
@@ -12039,14 +12145,16 @@ internal static unsafe class VulkanVideoPresenter
                     // page, start with current guest bytes and overlay only the
                     // shader changes before one bounded write. This preserves
                     // live CPU changes in unchanged bytes without degenerating
-                    // into millions of writes for alternating output patterns.
-                    const int pageSize = 4096;
-                    const int unreadableMergeGap = 16;
-                    var livePageBuffer = GuestDataPool.Shared.Rent(pageSize);
-                    var mappedPageBuffer = GuestDataPool.Shared.Rent(pageSize);
-                    var pageRuns = new List<(int Start, int Length)>(64);
-                    try
-                    {
+                     // into millions of writes for alternating output patterns.
+                     const int pageSize = 4096;
+                     const int unreadableMergeGap = 16;
+                     const int fragmentationRunThreshold = 64;
+                     var livePageBuffer = GuestDataPool.Shared.Rent(pageSize);
+                     var mappedPageBuffer = GuestDataPool.Shared.Rent(pageSize);
+                     var pageRuns = new List<(int Start, int Length)>(64);
+                     var coalescedPageRun = new List<(int Start, int Length)>(1);
+                     try
+                     {
                         for (var pageStart = 0;
                              pageStart < mappedBytes.Length;
                              pageStart += pageSize)
@@ -12060,75 +12168,75 @@ internal static unsafe class VulkanVideoPresenter
                                 continue;
                             }
 
-                            // HOST_COHERENT mappings are commonly uncached or
-                            // write-combined on the CPU. Read each changed page
-                            // once with a bulk copy, then perform the byte-level
-                            // merge against ordinary cached memory.
-                            var mappedPage = mappedPageBuffer.AsSpan(0, pageLength);
-                            mappedPageSource.CopyTo(mappedPage);
-                            pageRuns.Clear();
-                            var cursor = 0;
-                            while (cursor < pageLength)
-                            {
-                                while (cursor < pageLength &&
-                                       mappedPage[cursor] == shadowPage[cursor])
-                                {
-                                    cursor++;
-                                }
+                         // HOST_COHERENT mappings are commonly uncached or
+                         // write-combined on the CPU. Read each changed page
+                         // once with a bulk copy, then perform the byte-level
+                         // merge against ordinary cached memory.
+                         var mappedPage = mappedPageBuffer.AsSpan(0, pageLength);
+                         mappedPageSource.CopyTo(mappedPage);
+                         var pageChangedBytes = ScanChangedWritebackRuns(
+                             mappedPage,
+                             shadowPage,
+                             pageStart,
+                             pageRuns);
+                         changedRuns += pageRuns.Count;
+                         changedBytes += (ulong)pageChangedBytes;
+                         if (pageRuns.Count > 0 && firstChangedOffset < 0)
+                         {
+                             firstChangedOffset = pageRuns[0].Start;
+                         }
 
-                                if (cursor == pageLength)
-                                {
-                                    break;
-                                }
+                         if (pageRuns.Count == 0)
+                         {
+                             continue;
+                         }
 
-                                var runStart = cursor;
-                                while (cursor < pageLength &&
-                                       mappedPage[cursor] != shadowPage[cursor])
-                                {
-                                    cursor++;
-                                }
+                         // Highly fragmented pages are cheaper and safer to
+                         // publish as one bounded page overlay than as dozens
+                         // of tiny guest writes. The mapped bytes equal the
+                         // shadow for the gaps, so overlaying the full span
+                         // after reading the live guest page preserves CPU
+                         // changes outside the shader-written runs.
+                         List<(int Start, int Length)> runsToWrite;
+                         if (pageRuns.Count > fragmentationRunThreshold)
+                         {
+                             coalescedPageRun.Clear();
+                             coalescedPageRun.Add((
+                                 pageRuns[0].Start,
+                                 pageRuns[^1].Start + pageRuns[^1].Length - pageRuns[0].Start));
+                             runsToWrite = coalescedPageRun;
+                         }
+                         else
+                         {
+                             runsToWrite = pageRuns;
+                         }
 
-                                var runLength = cursor - runStart;
-                                pageRuns.Add((pageStart + runStart, runLength));
-                                changedRuns++;
-                                changedBytes += (ulong)runLength;
-                                if (firstChangedOffset < 0)
-                                {
-                                    firstChangedOffset = pageStart + runStart;
-                                }
-                            }
+                         changedPages++;
+                         var livePage = livePageBuffer.AsSpan(0, pageLength);
+                         if (memory.TryRead(guestAddress + (ulong)pageStart, livePage))
+                         {
+                             foreach (var run in runsToWrite)
+                             {
+                                 mappedPage.Slice(run.Start - pageStart, run.Length).CopyTo(
+                                     livePage.Slice(run.Start - pageStart, run.Length));
+                             }
 
-                            if (pageRuns.Count == 0)
-                            {
-                                continue;
-                            }
+                             if (memory.TryWrite(guestAddress + (ulong)pageStart, livePage))
+                             {
+                                 foreach (var run in runsToWrite)
+                                 {
+                                     mappedPage.Slice(run.Start - pageStart, run.Length).CopyTo(
+                                         shadowBytes.Slice(run.Start, run.Length));
+                                 }
 
-                            changedPages++;
-                            var livePage = livePageBuffer.AsSpan(0, pageLength);
-                            if (memory.TryRead(guestAddress + (ulong)pageStart, livePage))
-                            {
-                                foreach (var run in pageRuns)
-                                {
-                                    mappedPage.Slice(run.Start - pageStart, run.Length).CopyTo(
-                                        livePage.Slice(run.Start - pageStart, run.Length));
-                                }
+                                 writtenPages++;
+                                 writtenRuns += runsToWrite.Count;
+                                 continue;
+                             }
 
-                                if (memory.TryWrite(guestAddress + (ulong)pageStart, livePage))
-                                {
-                                    foreach (var run in pageRuns)
-                                    {
-                                        mappedPage.Slice(run.Start - pageStart, run.Length).CopyTo(
-                                            shadowBytes.Slice(run.Start, run.Length));
-                                    }
-
-                                    writtenPages++;
-                                    writtenRuns += pageRuns.Count;
-                                    continue;
-                                }
-
-                                foreach (var run in pageRuns)
-                                {
-                                    failedRuns++;
+                             foreach (var run in runsToWrite)
+                             {
+                                 failedRuns++;
                                     MarkGuestBufferDirty(
                                         allocation,
                                         range.Offset + (ulong)run.Start,
