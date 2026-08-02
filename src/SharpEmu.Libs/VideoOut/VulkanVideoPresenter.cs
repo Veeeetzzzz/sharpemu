@@ -14564,7 +14564,8 @@ internal static unsafe class VulkanVideoPresenter
                 Format.R8Unorm or
                 Format.R8Uint or
                 Format.R8Sint or
-                Format.R8SNorm => 8,
+                Format.R8SNorm or
+                Format.R8Srgb => 8,
                 // Every single-channel 16-bit format shares this class, not just
                 // the float one. Omitting the rest made GetVulkanImageByteCount
                 // return zero for them, and a zero expected size rejects the
@@ -14578,26 +14579,36 @@ internal static unsafe class VulkanVideoPresenter
                 Format.R16Sint or
                 Format.R8G8Unorm or
                 Format.R8G8SNorm or
+                Format.R8G8Srgb or
                 Format.R8G8Uint or
                 Format.R8G8Sint => 16,
                 Format.R32Uint or
                 Format.R32Sint or
                 Format.R32Sfloat or
                 Format.R16G16Unorm or
+                Format.R16G16SNorm or
                 Format.R16G16Uint or
                 Format.R16G16Sint or
                 Format.R16G16Sfloat or
                 Format.R8G8B8A8Unorm or
+                Format.R8G8B8A8SNorm or
                 Format.R8G8B8A8Srgb or
                 Format.R8G8B8A8Uint or
                 Format.R8G8B8A8Sint or
+                Format.B8G8R8A8Unorm or
+                Format.B8G8R8A8SNorm or
+                Format.B8G8R8A8Srgb or
+                Format.A8B8G8R8UnormPack32 or
+                Format.A8B8G8R8SrgbPack32 or
                 Format.A2R10G10B10UnormPack32 or
                 Format.A2B10G10R10UnormPack32 or
-                Format.B10G11R11UfloatPack32 => 32,
+                Format.B10G11R11UfloatPack32 or
+                Format.E5B9G9R9UfloatPack32 => 32,
                 Format.R32G32Uint or
                 Format.R32G32Sint or
                 Format.R32G32Sfloat or
                 Format.R16G16B16A16Unorm or
+                Format.R16G16B16A16SNorm or
                 Format.R16G16B16A16Uint or
                 Format.R16G16B16A16Sint or
                 Format.R16G16B16A16Sfloat => 64,
