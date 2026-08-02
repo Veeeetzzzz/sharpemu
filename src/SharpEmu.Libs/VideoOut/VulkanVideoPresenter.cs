@@ -1530,6 +1530,15 @@ internal static unsafe class VulkanVideoPresenter
                     _guestImageWorkSequences[texture.Address] = workSequence;
                 }
             }
+
+            // A compute dispatch can be the first GPU workload for a title.
+            // Draw/presentation paths start the consumer when they publish a
+            // frame, but a compute-only queue otherwise leaves this work
+            // stranded until a later draw arrives.
+            if (ShouldStartPresenter(_closed, _thread is not null))
+            {
+                StartPresenterLocked();
+            }
         }
 
         return workSequence;
@@ -2357,6 +2366,9 @@ internal static unsafe class VulkanVideoPresenter
         };
         _thread.Start();
     }
+
+    internal static bool ShouldStartPresenter(bool closed, bool threadActive) =>
+        !closed && !threadActive;
 
     /// <summary>
     /// Asks a running presenter to close its window; used at emulator
