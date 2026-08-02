@@ -10,11 +10,12 @@ Treating that swap as a raw image-view reinterpretation turns opaque RGBA8 data
 into a large ten-bit red value (for example, `0xFF000000` becomes red `1008 /
 1023`). That is the colour corruption seen in the noisy-bar frames.
 
-The presenter now keeps the existing image, converts its level-zero contents
-with a Vulkan `CmdBlitImage` through typed transfer scratch images, and then
-creates the requested view and render-pass attachments. The conversion is
-ordered after any open batch and its fence is waited before scratch resources
-are destroyed. Non-bit-incompatible view pairs retain the cheaper alias path.
+The presenter now keeps the existing image, converts every mip level (including
+all depth slices of a 3D image) with a Vulkan `CmdBlitImage` through typed
+transfer scratch images, and then creates the requested view and render-pass
+attachments. The conversion is ordered after any open batch and its fence is
+waited before scratch resources are destroyed. Non-bit-incompatible view pairs
+retain the cheaper alias path.
 
 Conversion is enabled by default for these known pairs. Set
 `SHARPEMU_DISABLE_REAL_FORMAT_CONVERSION=1` only when diagnosing a device or

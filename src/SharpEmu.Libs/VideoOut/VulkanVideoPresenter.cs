@@ -262,6 +262,24 @@ internal static unsafe class VulkanVideoPresenter
     internal static uint GetGuestTextureDepth(uint type, uint depth) =>
         IsGuestTexture3D(type) ? Math.Max(depth, 1u) : 1u;
 
+    internal static (uint Width, uint Height, uint Depth) GetGuestImageMipExtent(
+        uint width,
+        uint height,
+        uint depth,
+        uint type,
+        uint mipLevel) =>
+        (
+            GetMipDimension(width, mipLevel),
+            GetMipDimension(height, mipLevel),
+            IsGuestTexture3D(type)
+                ? GetMipDimension(depth, mipLevel)
+                : 1u);
+
+    private static uint GetMipDimension(uint dimension, uint mipLevel) =>
+        mipLevel >= 32
+            ? 1
+            : Math.Max(dimension >> (int)mipLevel, 1u);
+
     internal static ImageType GetGuestTextureImageType(uint type) =>
         IsGuestTexture3D(type) ? ImageType.Type3D : ImageType.Type2D;
 
@@ -14588,23 +14606,19 @@ internal static unsafe class VulkanVideoPresenter
             return Math.Min(Math.Max(requestedMipLevels, 1u), maximumMipLevels);
         }
 
-        private static uint GetMipDimension(uint dimension, uint mipLevel) =>
-            mipLevel >= 32
-                ? 1
-                : Math.Max(dimension >> (int)mipLevel, 1u);
-
         private unsafe (Image Image, DeviceMemory Memory) CreateTransferScratchImage(
             Format format,
-            uint width,
-            uint height)
+            ImageType imageType,
+            Extent3D extent,
+            uint mipLevels)
         {
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,
-                ImageType = ImageType.Type2D,
+                ImageType = imageType,
                 Format = format,
-                Extent = new Extent3D(width, height, 1),
-                MipLevels = 1,
+                Extent = extent,
+                MipLevels = mipLevels,
                 ArrayLayers = 1,
                 Samples = SampleCountFlags.Count1Bit,
                 Tiling = ImageTiling.Optimal,
@@ -14651,14 +14665,28 @@ internal static unsafe class VulkanVideoPresenter
             FlushBatchedGuestCommands();
             WaitForAllGuestSubmissions();
 
+            var imageType = GetGuestTextureImageType(resource.Type);
+            var mipLevels = Math.Max(resource.MipLevels, 1u);
+            var fullExtent = GetGuestImageMipExtent(
+                resource.Width,
+                resource.Height,
+                resource.Depth,
+                resource.Type,
+                mipLevel: 0);
+            var scratchExtent = new Extent3D(
+                fullExtent.Width,
+                fullExtent.Height,
+                fullExtent.Depth);
             var (oldTyped, oldMemory) = CreateTransferScratchImage(
                 fromFormat,
-                resource.Width,
-                resource.Height);
+                imageType,
+                scratchExtent,
+                mipLevels);
             var (newTyped, newMemory) = CreateTransferScratchImage(
                 toFormat,
-                resource.Width,
-                resource.Height);
+                imageType,
+                scratchExtent,
+                mipLevels);
             CommandBuffer commandBuffer = default;
             var submitted = false;
             var completed = false;
@@ -14674,29 +14702,40 @@ internal static unsafe class VulkanVideoPresenter
                     _vk.BeginCommandBuffer(commandBuffer, &beginInfo),
                     "vkBeginCommandBuffer(format-convert)");
 
-                var resourceToSrc = new ImageMemoryBarrier
+                for (uint mipLevel = 0; mipLevel < mipLevels; mipLevel++)
                 {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = AccessFlags.ShaderReadBit,
-                    DstAccessMask = AccessFlags.TransferReadBit,
-                    OldLayout = ImageLayout.ShaderReadOnlyOptimal,
-                    NewLayout = ImageLayout.TransferSrcOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = resource.Image,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
-                };
-                _vk.CmdPipelineBarrier(
-                    commandBuffer,
-                    PipelineStageFlags.AllCommandsBit,
-                    PipelineStageFlags.TransferBit,
-                    0,
-                    0,
-                    null,
-                    0,
-                    null,
-                    1,
-                    &resourceToSrc);
+                    var mipExtent = GetGuestImageMipExtent(
+                        resource.Width,
+                        resource.Height,
+                        resource.Depth,
+                        resource.Type,
+                        mipLevel);
+                    var resourceRange = ColorSubresourceRange(mipLevel, 1);
+                    var scratchRange = ColorSubresourceRange(mipLevel, 1);
+
+                    var resourceToSrc = new ImageMemoryBarrier
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = AccessFlags.ShaderReadBit,
+                        DstAccessMask = AccessFlags.TransferReadBit,
+                        OldLayout = ImageLayout.ShaderReadOnlyOptimal,
+                        NewLayout = ImageLayout.TransferSrcOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = resource.Image,
+                        SubresourceRange = resourceRange,
+                    };
+                    _vk.CmdPipelineBarrier(
+                        commandBuffer,
+                        PipelineStageFlags.AllCommandsBit,
+                        PipelineStageFlags.TransferBit,
+                        0,
+                        0,
+                        null,
+                        0,
+                        null,
+                        1,
+                        &resourceToSrc);
 
                 var oldTypedToDst = new ImageMemoryBarrier
                 {
@@ -14707,7 +14746,7 @@ internal static unsafe class VulkanVideoPresenter
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     Image = oldTyped,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
+                    SubresourceRange = scratchRange,
                 };
                 _vk.CmdPipelineBarrier(
                     commandBuffer,
@@ -14725,17 +14764,20 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     SrcSubresource = new ImageSubresourceLayers(
                         ImageAspectFlags.ColorBit,
-                        0,
+                        mipLevel,
                         0,
                         1),
                     SrcOffset = new Offset3D(0, 0, 0),
                     DstSubresource = new ImageSubresourceLayers(
                         ImageAspectFlags.ColorBit,
-                        0,
+                        mipLevel,
                         0,
                         1),
                     DstOffset = new Offset3D(0, 0, 0),
-                    Extent = new Extent3D(resource.Width, resource.Height, 1),
+                    Extent = new Extent3D(
+                        mipExtent.Width,
+                        mipExtent.Height,
+                        mipExtent.Depth),
                 };
                 _vk.CmdCopyImage(
                     commandBuffer,
@@ -14756,7 +14798,7 @@ internal static unsafe class VulkanVideoPresenter
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     Image = oldTyped,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
+                    SubresourceRange = scratchRange,
                 };
                 _vk.CmdPipelineBarrier(
                     commandBuffer,
@@ -14779,7 +14821,7 @@ internal static unsafe class VulkanVideoPresenter
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     Image = newTyped,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
+                    SubresourceRange = scratchRange,
                 };
                 _vk.CmdPipelineBarrier(
                     commandBuffer,
@@ -14797,29 +14839,29 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     SrcSubresource = new ImageSubresourceLayers(
                         ImageAspectFlags.ColorBit,
-                        0,
+                        mipLevel,
                         0,
                         1),
                     SrcOffsets = new ImageBlit.SrcOffsetsBuffer
                     {
                         Element0 = new Offset3D(0, 0, 0),
                         Element1 = new Offset3D(
-                            checked((int)resource.Width),
-                            checked((int)resource.Height),
-                            1),
+                            checked((int)mipExtent.Width),
+                            checked((int)mipExtent.Height),
+                            checked((int)mipExtent.Depth)),
                     },
                     DstSubresource = new ImageSubresourceLayers(
                         ImageAspectFlags.ColorBit,
-                        0,
+                        mipLevel,
                         0,
                         1),
                     DstOffsets = new ImageBlit.DstOffsetsBuffer
                     {
                         Element0 = new Offset3D(0, 0, 0),
                         Element1 = new Offset3D(
-                            checked((int)resource.Width),
-                            checked((int)resource.Height),
-                            1),
+                            checked((int)mipExtent.Width),
+                            checked((int)mipExtent.Height),
+                            checked((int)mipExtent.Depth)),
                     },
                 };
                 _vk.CmdBlitImage(
@@ -14842,7 +14884,7 @@ internal static unsafe class VulkanVideoPresenter
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     Image = newTyped,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
+                    SubresourceRange = scratchRange,
                 };
                 _vk.CmdPipelineBarrier(
                     commandBuffer,
@@ -14866,7 +14908,7 @@ internal static unsafe class VulkanVideoPresenter
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     Image = resource.Image,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
+                    SubresourceRange = resourceRange,
                 };
                 _vk.CmdPipelineBarrier(
                     commandBuffer,
@@ -14898,7 +14940,7 @@ internal static unsafe class VulkanVideoPresenter
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     Image = resource.Image,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
+                    SubresourceRange = resourceRange,
                 };
                 _vk.CmdPipelineBarrier(
                     commandBuffer,
@@ -14911,6 +14953,7 @@ internal static unsafe class VulkanVideoPresenter
                     null,
                     1,
                     &resourceToShaderRead);
+                }
 
                 Check(
                     _vk.EndCommandBuffer(commandBuffer),
@@ -14932,7 +14975,8 @@ internal static unsafe class VulkanVideoPresenter
                         $"source_format={fromFormat} target_format={toFormat} " +
                         $"address=0x{resource.Address:X16} " +
                         "reason=bit-incompatible-view-reinterpret " +
-                        $"size={resource.Width}x{resource.Height}");
+                        $"size={resource.Width}x{resource.Height}x{resource.Depth} " +
+                        $"mips={mipLevels}");
                 }
             }
             finally
