@@ -280,6 +280,20 @@ internal static unsafe class VulkanVideoPresenter
             ? 1
             : Math.Max(dimension >> (int)mipLevel, 1u);
 
+    internal static bool ShouldRefreshGuestBuffer(
+        ReadOnlySpan<byte> captured,
+        ReadOnlySpan<byte> shadow,
+        ReadOnlySpan<byte> live,
+        bool liveReadSucceeded)
+    {
+        if (!captured.SequenceEqual(shadow))
+        {
+            return true;
+        }
+
+        return liveReadSucceeded && !live.SequenceEqual(shadow);
+    }
+
     internal static ImageType GetGuestTextureImageType(uint type) =>
         IsGuestTexture3D(type) ? ImageType.Type3D : ImageType.Type2D;
 
@@ -10406,7 +10420,29 @@ internal static unsafe class VulkanVideoPresenter
 
             var source = guestBuffer.Data.AsSpan(0, guestBuffer.Length);
             var shadow = allocation.Shadow.AsSpan(checked((int)guestOffset), guestBuffer.Length);
-            if (!source.SequenceEqual(shadow))
+            var needsRefresh = !source.SequenceEqual(shadow);
+            if (!needsRefresh && _guestMemory is not null)
+            {
+                var live = GuestDataPool.Shared.Rent(guestBuffer.Length);
+                try
+                {
+                    var liveSpan = live.AsSpan(0, guestBuffer.Length);
+                    var liveReadSucceeded = _guestMemory.TryRead(
+                        guestBuffer.BaseAddress,
+                        liveSpan);
+                    needsRefresh = ShouldRefreshGuestBuffer(
+                        source,
+                        shadow,
+                        liveSpan,
+                        liveReadSucceeded);
+                }
+                finally
+                {
+                    GuestDataPool.Shared.Return(live);
+                }
+            }
+
+            if (needsRefresh)
             {
                 if (!guestBuffer.Writable &&
                     (allocation.LastUseTimeline > _completedTimeline ||

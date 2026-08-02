@@ -21,3 +21,10 @@ fallback, because no full-page merge is safe without the live guest bytes.
 This keeps writeback correctness unchanged while avoiding a byte-at-a-time scan
 and a large number of tiny writes on fragmented GPU output. Regression coverage
 is in `VulkanWritebackScanTests`.
+
+Read-side buffer reuse also probes the live guest-memory backing when the
+parser's captured bytes still match the Vulkan shadow. A CPU write can land
+between parsing and descriptor creation, so a live-memory mismatch forces the
+same visibility barrier and refresh path before the buffer is reused. This
+prevents stale global-buffer descriptors without adding a live read when the
+captured snapshot already differs from the shadow.
