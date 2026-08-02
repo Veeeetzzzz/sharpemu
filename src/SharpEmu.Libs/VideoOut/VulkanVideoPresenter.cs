@@ -15011,6 +15011,7 @@ internal static unsafe class VulkanVideoPresenter
                 presentation.TranslatedDraw is null &&
                 presentation.GuestImageAddress == 0)
             {
+                _presentedSequence = presentation.Sequence;
                 return;
             }
 
@@ -15027,6 +15028,7 @@ internal static unsafe class VulkanVideoPresenter
                         _extent.Height);
                 if ((ulong)pixels.Length > _stagingSize)
                 {
+                    _presentedSequence = presentation.Sequence;
                     return;
                 }
 
@@ -15066,6 +15068,7 @@ internal static unsafe class VulkanVideoPresenter
                     DestroyGuestImage(presentedGuestImage);
                 }
 
+                _presentedSequence = presentation.Sequence;
                 return;
             }
             if (ownsPresentedGuestImageVersion)
