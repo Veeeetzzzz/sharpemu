@@ -215,7 +215,12 @@ public sealed record Gen5ExportControl(
 
 public sealed record Gen5InterpolationControl(
     uint Attribute,
-    uint Channel) : Gen5InstructionControl;
+    uint Channel,
+    bool AttributeWordHigh = false,
+    bool HalfPrecisionResult = false,
+    bool DestinationHigh = false,
+    uint OutputModifier = 0,
+    bool Clamp = false) : Gen5InstructionControl;
 
 public sealed record Gen5Vop3Control(
     uint AbsoluteMask,
@@ -241,7 +246,11 @@ public sealed record Gen5SdwaControl(
 // Packed (VOP3P) source and destination modifiers. Each mask holds one bit per
 // source operand. OpSel/OpSelHi pick which 16-bit half of a source feeds the low
 // and high result lanes respectively; NegLo/NegHi negate the value routed to each
-// lane. Clamp saturates each output half to [0, 1].
+// lane. Clamp saturates each output half to [0, 1]. Dot and MIX instructions
+// deliberately reinterpret some fields: V_DOT2_F32_F16 applies the low/high
+// masks to the two packed components of src0/src1, but treats neg_hi[2] as
+// fabs(src2.f32) and neg_lo[2] as fneg(src2.f32); MIX uses op_sel/op_sel_hi as
+// a combined width/half selector and neg_hi as fabs for every source.
 public sealed record Gen5Vop3pControl(
     uint OpSelMask,
     uint OpSelHiMask,

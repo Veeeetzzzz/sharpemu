@@ -104,6 +104,22 @@ public static partial class Gen5MslTranslator
             };
         }
 
+        private static bool IsMetalAtomicImageFormat(IReadOnlyList<uint> descriptor)
+        {
+            if (descriptor.Count < 2)
+            {
+                return false;
+            }
+
+            var unifiedFormat = (descriptor[1] >> 20) & 0x1FFu;
+            return Gfx10UnifiedFormat.TryDecode(
+                       unifiedFormat,
+                       out var dataFormat,
+                       out var numberType) &&
+                   dataFormat == 4 &&
+                   numberType is 4 or 5;
+        }
+
         /// <summary>Per image binding: its sampler's [[id(N)]] inside the sampler
         /// argument buffer, or -1 for storage images. Set by DeclareImageKinds.</summary>
         private int[] _samplerSlots = [];
@@ -325,6 +341,32 @@ public static partial class Gen5MslTranslator
                 return true;
             }
 
+            if (instruction.Opcode.StartsWith("ImageAtomic", StringComparison.Ordinal))
+            {
+                if (!isStorage)
+                {
+                    error = "image atomic is not bound as storage";
+                    return false;
+                }
+
+                if (kind == "float" ||
+                    !TryEmitImageAtomic(
+                        instruction,
+                        image,
+                        bindingIndex,
+                        texture,
+                        kind,
+                        out error))
+                {
+                    error = string.IsNullOrEmpty(error)
+                        ? $"unsupported storage image opcode {instruction.Opcode}"
+                        : error;
+                    return false;
+                }
+
+                return true;
+            }
+
             if (isStorage && instruction.Opcode is not ("ImageLoad" or "ImageLoadMip"))
             {
                 error = $"unsupported storage image opcode {instruction.Opcode}";
@@ -403,6 +445,104 @@ public static partial class Gen5MslTranslator
                 }
             }
 
+            return true;
+        }
+
+        /// <summary>
+        /// Emits the GFX10 image-atomic family through Metal 3.1 texture atomics.
+        /// Metal exposes a four-component atomic value even though the only legal
+        /// 32-bit formats are R32Sint/R32Uint, so the compare/exchange loop changes
+        /// X while preserving the implementation-defined padding components.
+        /// Using raw uint expressions also preserves signed MIN/MAX semantics when
+        /// the guest opcode's signedness differs from the descriptor number type.
+        /// </summary>
+        private bool TryEmitImageAtomic(
+            Gen5ShaderInstruction instruction,
+            Gen5ImageControl image,
+            int bindingIndex,
+            string texture,
+            string kind,
+            out string error)
+        {
+            error = string.Empty;
+            if (!IsMetalAtomicImageFormat(
+                    _evaluation.ImageBindings[bindingIndex].ResourceDescriptor))
+            {
+                error = "Metal texture atomics require an R32Sint or R32Uint image";
+                return false;
+            }
+
+            var operation = instruction.Opcode["ImageAtomic".Length..];
+            if (operation is not (
+                    "Swap" or "Cmpswap" or "Add" or "Sub" or
+                    "Smin" or "Umin" or "Smax" or "Umax" or
+                    "And" or "Or" or "Xor" or "Inc" or "Dec"))
+            {
+                return false;
+            }
+
+            var x = Temp("int", $"as_type<int>({ImageIntegerAddress(image, 0)})");
+            var y = Temp("int", $"as_type<int>({ImageIntegerAddress(image, 1)})");
+            var coordinates = Temp(
+                "uint2",
+                $"uint2((uint)clamp({x}, 0, (int){texture}.get_width() - 1), " +
+                $"(uint)clamp({y}, 0, (int){texture}.get_height() - 1))");
+            var value = Temp("uint", $"v[{image.VectorData}]");
+            var comparator = operation == "Cmpswap"
+                ? Temp("uint", $"v[{image.VectorData + 1}]")
+                : string.Empty;
+            var vectorType = VectorLiteral(kind);
+
+            Line("if (exec)");
+            Line("{");
+            _indent++;
+            var expected = Temp($"vec<{kind}, 4>", $"{texture}.atomic_load({coordinates})");
+            Line("while (true)");
+            Line("{");
+            _indent++;
+            var oldRaw = Temp(
+                "uint",
+                kind == "uint" ? $"{expected}.x" : $"as_type<uint>({expected}.x)");
+
+            if (operation == "Cmpswap")
+            {
+                Line($"if ({oldRaw} != {comparator}) break;");
+            }
+
+            var desiredRaw = operation switch
+            {
+                "Swap" or "Cmpswap" => value,
+                "Add" => $"({oldRaw} + {value})",
+                "Sub" => $"({oldRaw} - {value})",
+                "Smin" => $"as_type<uint>(min(as_type<int>({oldRaw}), as_type<int>({value})))",
+                "Umin" => $"min({oldRaw}, {value})",
+                "Smax" => $"as_type<uint>(max(as_type<int>({oldRaw}), as_type<int>({value})))",
+                "Umax" => $"max({oldRaw}, {value})",
+                "And" => $"({oldRaw} & {value})",
+                "Or" => $"({oldRaw} | {value})",
+                "Xor" => $"({oldRaw} ^ {value})",
+                // RDNA2: INC wraps when old >= DATA; DEC reloads DATA when
+                // old is zero or greater than DATA.
+                "Inc" => $"({oldRaw} >= {value} ? 0u : {oldRaw} + 1u)",
+                "Dec" => $"({oldRaw} == 0u || {oldRaw} > {value} ? {value} : {oldRaw} - 1u)",
+                _ => throw new InvalidOperationException(),
+            };
+            var desired = Temp($"vec<{kind}, 4>", expected);
+            Line($"{desired}.x = " +
+                 (kind == "uint" ? desiredRaw : $"as_type<int>({desiredRaw})") + ";");
+            Line($"if ({texture}.atomic_compare_exchange_weak({coordinates}, &{expected}, {desired})) break;");
+            _indent--;
+            Line("}");
+
+            if (image.Glc)
+            {
+                StoreVector(
+                    image.VectorData,
+                    kind == "uint" ? $"{expected}.x" : $"as_type<uint>({expected}.x)");
+            }
+
+            _indent--;
+            Line("}");
             return true;
         }
 
@@ -830,9 +970,31 @@ public static partial class Gen5MslTranslator
                 return false;
             }
 
-            StoreVector(
-                instruction.Destinations[0].Value,
-                AsUInt($"sharpemu_in.attr{interpolation.Attribute}[{interpolation.Channel}]"));
+            string value = $"sharpemu_in.attr{interpolation.Attribute}[{interpolation.Channel}]";
+            value = interpolation.OutputModifier switch
+            {
+                1 => $"(({value}) * 2.0f)",
+                2 => $"(({value}) * 4.0f)",
+                3 => $"(({value}) * 0.5f)",
+                _ => value,
+            };
+            if (interpolation.Clamp)
+            {
+                value = $"clamp({value}, 0.0f, 1.0f)";
+            }
+
+            var destination = instruction.Destinations[0].Value;
+            if (!interpolation.HalfPrecisionResult)
+            {
+                StoreVector(destination, AsUInt(value));
+                return true;
+            }
+
+            var half = Temp("uint", $"(uint)as_type<ushort>(half({value}))");
+            var packed = interpolation.DestinationHigh
+                ? $"((v[{destination}] & 0x0000FFFFu) | ({half} << 16))"
+                : $"((v[{destination}] & 0xFFFF0000u) | {half})";
+            StoreVector(destination, packed);
             return true;
         }
 

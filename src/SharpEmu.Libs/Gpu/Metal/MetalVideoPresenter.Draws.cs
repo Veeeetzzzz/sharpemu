@@ -75,6 +75,9 @@ internal static partial class MetalVideoPresenter
     private const nuint UsageShaderRead = 1;
     private const nuint UsageShaderWrite = 2;
     private const nuint UsageRenderTarget = 4;
+    // MTLTextureUsageShaderAtomic. Apple permits 32-bit texture atomics only
+    // for R32Uint/R32Sint (and 64-bit atomics for RG32Uint).
+    private const nuint UsageShaderAtomic = 1u << 5;
     private static bool _tracedTriangleFan;
 
     private sealed record TranslatedGuestDraw(
@@ -1720,10 +1723,16 @@ internal static partial class MetalVideoPresenter
         MetalNative.Send(descriptor, MetalNative.Selector("setStorageMode:"), (nint)0);
         if (texture.IsStorage)
         {
+            var usage = UsageShaderRead | UsageShaderWrite;
+            if (textureFormat.Format is MtlPixelFormat.R32Uint or MtlPixelFormat.R32Sint)
+            {
+                usage |= UsageShaderAtomic;
+            }
+
             MetalNative.Send(
                 descriptor,
                 MetalNative.Selector("setUsage:"),
-                (nint)(UsageShaderRead | UsageShaderWrite));
+                (nint)usage);
         }
         else if (texture.DstSelect != 0xFAC && texture.DstSelect != 0)
         {
