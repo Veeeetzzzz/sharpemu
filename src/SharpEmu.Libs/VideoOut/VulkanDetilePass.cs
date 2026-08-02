@@ -60,6 +60,8 @@ internal sealed unsafe class VulkanDetilePass : IDisposable
     private readonly List<DescriptorPool> _descriptorPools = new();
     private const uint DescriptorSetsPerPool = 64;
     private const ulong MinimumBufferBucket = 4096;
+    private const ulong MaximumCachedBufferBytes = 256UL * 1024 * 1024;
+    private ulong _cachedBufferBytes;
 
     public VulkanDetilePass(
         Vk vk,
@@ -87,8 +89,9 @@ internal sealed unsafe class VulkanDetilePass : IDisposable
 
     /// <summary>Opaque handle to the pooled resources one recorded detile is using.
     /// The caller hands it back to <see cref="Retire"/> once the command buffer they
-    /// were recorded into has completed; nothing is destroyed, the buffers and the
-    /// descriptor set return to this pass's free lists for the next texture.</summary>
+    /// were recorded into has completed. The descriptor set and buffers return to
+    /// this pass's cache when its byte budget allows; excess idle buffers are
+    /// released immediately.</summary>
     public sealed class Transients
     {
         internal static readonly Transients Empty = new();
@@ -343,12 +346,21 @@ internal sealed unsafe class VulkanDetilePass : IDisposable
         return bucket;
     }
 
+    internal static bool CanCacheBuffer(
+        ulong cachedBytes,
+        ulong allocationBytes,
+        ulong maximumCachedBytes) =>
+        allocationBytes <= maximumCachedBytes &&
+        cachedBytes <= maximumCachedBytes - allocationBytes;
+
     private Allocation RentBuffer(ulong size, bool hostVisible)
     {
         var bucket = BucketFor(size);
         if (_bufferPool.TryGetValue((bucket, hostVisible), out var free) && free.Count > 0)
         {
-            return free.Pop();
+            var allocation = free.Pop();
+            _cachedBufferBytes -= allocation.Capacity;
+            return allocation;
         }
 
         return CreateBuffer(bucket, hostVisible);
@@ -361,6 +373,15 @@ internal sealed unsafe class VulkanDetilePass : IDisposable
             return;
         }
 
+        if (!CanCacheBuffer(
+                _cachedBufferBytes,
+                allocation.Capacity,
+                MaximumCachedBufferBytes))
+        {
+            DestroyTrackedAllocation(allocation);
+            return;
+        }
+
         var key = (allocation.Capacity, allocation.HostVisible);
         if (!_bufferPool.TryGetValue(key, out var free))
         {
@@ -369,6 +390,7 @@ internal sealed unsafe class VulkanDetilePass : IDisposable
         }
 
         free.Push(allocation);
+        _cachedBufferBytes += allocation.Capacity;
     }
 
     private DescriptorSet RentDescriptorSet()
@@ -649,6 +671,8 @@ internal sealed unsafe class VulkanDetilePass : IDisposable
 
     private Allocation CreateBuffer(ulong size, bool hostVisible)
     {
+        VkBuffer buffer = default;
+        DeviceMemory memory = default;
         var bufferInfo = new BufferCreateInfo
         {
             SType = StructureType.BufferCreateInfo,
@@ -656,23 +680,31 @@ internal sealed unsafe class VulkanDetilePass : IDisposable
             Usage = BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit,
             SharingMode = SharingMode.Exclusive,
         };
-        Check(_vk.CreateBuffer(_device, &bufferInfo, null, out var buffer), "vkCreateBuffer(detile)");
-
-        _vk.GetBufferMemoryRequirements(_device, buffer, out var requirements);
-        var required = hostVisible
-            ? MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit
-            : MemoryPropertyFlags.DeviceLocalBit;
-        var allocateInfo = new MemoryAllocateInfo
+        try
         {
-            SType = StructureType.MemoryAllocateInfo,
-            AllocationSize = requirements.Size,
-            MemoryTypeIndex = FindMemoryType(requirements.MemoryTypeBits, required, hostVisible),
-        };
-        Check(_vk.AllocateMemory(_device, &allocateInfo, null, out var memory), "vkAllocateMemory(detile)");
-        Check(_vk.BindBufferMemory(_device, buffer, memory, 0), "vkBindBufferMemory(detile)");
-        var allocation = new Allocation(buffer, memory, size, hostVisible);
-        _allAllocations.Add(allocation);
-        return allocation;
+            Check(_vk.CreateBuffer(_device, &bufferInfo, null, out buffer), "vkCreateBuffer(detile)");
+
+            _vk.GetBufferMemoryRequirements(_device, buffer, out var requirements);
+            var required = hostVisible
+                ? MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit
+                : MemoryPropertyFlags.DeviceLocalBit;
+            var allocateInfo = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = requirements.Size,
+                MemoryTypeIndex = FindMemoryType(requirements.MemoryTypeBits, required, hostVisible),
+            };
+            Check(_vk.AllocateMemory(_device, &allocateInfo, null, out memory), "vkAllocateMemory(detile)");
+            Check(_vk.BindBufferMemory(_device, buffer, memory, 0), "vkBindBufferMemory(detile)");
+            var allocation = new Allocation(buffer, memory, size, hostVisible);
+            _allAllocations.Add(allocation);
+            return allocation;
+        }
+        catch
+        {
+            DestroyBuffer(buffer, memory);
+            throw;
+        }
     }
 
     private uint FindMemoryType(uint typeBits, MemoryPropertyFlags requiredFlags, bool hostVisible)
@@ -831,6 +863,12 @@ internal sealed unsafe class VulkanDetilePass : IDisposable
         }
     }
 
+    private void DestroyTrackedAllocation(Allocation allocation)
+    {
+        _allAllocations.Remove(allocation);
+        DestroyBuffer(allocation.Buffer, allocation.Memory);
+    }
+
     private void Check(Result result, string operation)
     {
         if (result != Result.Success)
@@ -855,6 +893,7 @@ internal sealed unsafe class VulkanDetilePass : IDisposable
 
         _allAllocations.Clear();
         _bufferPool.Clear();
+        _cachedBufferBytes = 0;
         _xorTermBuffers.Clear();
         _blockTermBuffers.Clear();
         _placeholderTermBuffer = default;

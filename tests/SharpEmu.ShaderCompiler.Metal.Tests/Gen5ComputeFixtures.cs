@@ -183,9 +183,14 @@ internal static class Gen5ComputeFixtures
 
     public static Gen5MslShader CompilePixelOrThrow(
         Gen5PixelOutputKind outputKind = Gen5PixelOutputKind.Float)
+        => CompilePixelOrThrow(PixelWords, outputKind);
+
+    public static Gen5MslShader CompilePixelOrThrow(
+        uint[] words,
+        Gen5PixelOutputKind outputKind = Gen5PixelOutputKind.Float)
     {
         var memory = new FakeGuestMemory();
-        memory.AddRegion(ProgramAddress, PixelWords);
+        memory.AddRegion(ProgramAddress, words);
         var ctx = new CpuContext(memory, Generation.Gen5);
         if (!Gen5ShaderTranslator.TryDecodeProgram(ctx, ProgramAddress, out var program, out var decodeError))
         {

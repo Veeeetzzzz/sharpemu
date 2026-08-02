@@ -117,6 +117,25 @@ internal static unsafe class VulkanVideoPresenter
     internal static bool IsGuestTexture3D(uint type) =>
         type == Gen5TextureType3D;
 
+    internal static bool HasGuestSubmissionCapacity(
+        int pendingCount,
+        int abandonedCount,
+        int maximumInFlight)
+    {
+        if (pendingCount < 0 || abandonedCount < 0 || maximumInFlight <= 0)
+        {
+            return false;
+        }
+
+        // Timed-out submissions remain live Vulkan work until their fences
+        // signal. They retain command buffers, descriptors, staging buffers,
+        // detile allocations, and translated resources just like submissions
+        // in the normal queue, so excluding them turns the nominal cap into an
+        // unbounded native-resource backlog.
+        return pendingCount < maximumInFlight &&
+               abandonedCount < maximumInFlight - pendingCount;
+    }
+
     internal static uint GetGuestTextureDepth(uint type, uint depth) =>
         IsGuestTexture3D(type) ? Math.Max(depth, 1u) : 1u;
 
@@ -4873,7 +4892,10 @@ internal static unsafe class VulkanVideoPresenter
             var pixels = new Span<byte>(
                 (void*)_overlayStagingMapped[frameSlot],
                 PerfOverlay.PanelWidth * PerfOverlay.PanelHeight * 4);
-            PerfOverlay.Fill(pixels, pendingWork, _pendingGuestSubmissions.Count);
+            PerfOverlay.Fill(
+                pixels,
+                pendingWork,
+                _pendingGuestSubmissions.Count + _abandonedGuestSubmissions.Count);
             var presentationTarget = PresentationTargetImage(imageIndex);
 
             var toTransferDst = new ImageMemoryBarrier
@@ -5309,7 +5331,10 @@ internal static unsafe class VulkanVideoPresenter
         private void EnsureGuestSubmissionCapacity()
         {
             CollectCompletedGuestSubmissions(waitForOldest: false);
-            if (_pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
+            if (!HasGuestSubmissionCapacity(
+                    _pendingGuestSubmissions.Count,
+                    _abandonedGuestSubmissions.Count,
+                    MaxInFlightGuestSubmissions))
             {
                 // Bounded wait so the macOS main thread returns to its event
                 // pump promptly under a slow-compute backlog; if the oldest
@@ -5320,6 +5345,30 @@ internal static unsafe class VulkanVideoPresenter
                         ? _guestFenceWaitTimeoutNs
                         : _submissionCapacityWaitNs);
             }
+        }
+
+        private PendingGuestSubmission? FindTrackedGuestSubmission(ulong timeline)
+        {
+            foreach (var submission in _pendingGuestSubmissions)
+            {
+                if (submission.Timeline == timeline)
+                {
+                    return submission;
+                }
+            }
+
+            // A fence timeout removes a submission from the blocking FIFO but
+            // deliberately keeps every Vulkan object alive in this queue. CPU
+            // visibility still has to find and wait for that submission.
+            foreach (var submission in _abandonedGuestSubmissions)
+            {
+                if (submission.Timeline == timeline)
+                {
+                    return submission;
+                }
+            }
+
+            return null;
         }
 
         private void WaitForAllGuestSubmissions()
@@ -5551,15 +5600,7 @@ internal static unsafe class VulkanVideoPresenter
                 return true;
             }
 
-            PendingGuestSubmission? target = null;
-            foreach (var submission in _pendingGuestSubmissions)
-            {
-                if (submission.Timeline == targetTimeline)
-                {
-                    target = submission;
-                    break;
-                }
-            }
+            var target = FindTrackedGuestSubmission(targetTimeline);
 
             if (target is null)
             {
@@ -5658,15 +5699,7 @@ internal static unsafe class VulkanVideoPresenter
                 return;
             }
 
-            PendingGuestSubmission? target = null;
-            foreach (var submission in _pendingGuestSubmissions)
-            {
-                if (submission.Timeline == targetTimeline)
-                {
-                    target = submission;
-                    break;
-                }
-            }
+            var target = FindTrackedGuestSubmission(targetTimeline);
 
             if (target is null)
             {
@@ -14567,6 +14600,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             using var profileScope = RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.Idle);
             var gpuWorkInFlight = _pendingGuestSubmissions.Count > 0 ||
+                _abandonedGuestSubmissions.Count > 0 ||
                 Array.Exists(_frameFencePending, static pending => pending);
             lock (_gate)
             {
@@ -14683,8 +14717,10 @@ internal static unsafe class VulkanVideoPresenter
                     CollectCompletedGuestSubmissions(waitForOldest: false);
                 }
 
-                if (OperatingSystem.IsMacOS() &&
-                    _pendingGuestSubmissions.Count >= MaxInFlightGuestSubmissions)
+                if (!HasGuestSubmissionCapacity(
+                        _pendingGuestSubmissions.Count,
+                        _abandonedGuestSubmissions.Count,
+                        MaxInFlightGuestSubmissions))
                 {
                     break;
                 }

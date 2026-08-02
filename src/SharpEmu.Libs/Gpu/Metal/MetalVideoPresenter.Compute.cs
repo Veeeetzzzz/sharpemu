@@ -308,10 +308,16 @@ internal static partial class MetalVideoPresenter
             descriptor.Width,
             descriptor.Height,
             mipmapped: false);
+        var usage = UsageShaderRead | UsageShaderWrite | UsageRenderTarget;
+        if (format is MtlPixelFormat.R32Uint or MtlPixelFormat.R32Sint)
+        {
+            usage |= UsageShaderAtomic;
+        }
+
         MetalNative.Send(
             textureDescriptor,
             MetalNative.Selector("setUsage:"),
-            (nint)(UsageShaderRead | UsageShaderWrite | UsageRenderTarget));
+            (nint)usage);
         var image = new GuestImage
         {
             Texture = MetalNative.Send(

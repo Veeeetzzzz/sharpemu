@@ -18,7 +18,7 @@ public static partial class Gen5MslTranslator
             out string error)
         {
             error = string.Empty;
-            if (instruction.Opcode == "VNop")
+            if (instruction.Opcode is "VNop" or "VPipeflush" or "VClrexcp")
             {
                 return true;
             }
@@ -114,6 +114,40 @@ public static partial class Gen5MslTranslator
                         guardWithExec: false);
                     return true;
                 }
+                case "VMovreldB32":
+                case "VMovrelsB32":
+                case "VMovrelsdB32":
+                case "VMovrelsd2B32":
+                    return TryEmitVectorRelativeMove(instruction, out error);
+                case "VSwapB32":
+                case "VSwaprelB32":
+                    return TryEmitVectorSwap(instruction, out error);
+                case "VLshlrevB64":
+                case "VLshrrevB64":
+                case "VAshrrevI64":
+                    return TryEmitVector64Shift(instruction, out error);
+                case "VQsadPkU16U8":
+                case "VMqsadPkU16U8":
+                case "VMqsadU32U8":
+                    return TryEmitPackedSad(instruction, out error);
+                case "VFrexpMantF64":
+                    return TryEmitFrexpMantissaF64(instruction, out error);
+                case "VCvtF64I32":
+                    return TryEmitFloat64FromInt32(instruction, signed: true, out error);
+                case "VCvtF64U32":
+                    return TryEmitFloat64FromInt32(instruction, signed: false, out error);
+                case "VCvtF64F32":
+                    return TryEmitFloat64FromF32(instruction, out error);
+                case "VTruncF64":
+                    return TryEmitFloat64Round(instruction, Float64RoundMode.Trunc, out error);
+                case "VCeilF64":
+                    return TryEmitFloat64Round(instruction, Float64RoundMode.Ceil, out error);
+                case "VRndneF64":
+                    return TryEmitFloat64Round(instruction, Float64RoundMode.NearestEven, out error);
+                case "VFloorF64":
+                    return TryEmitFloat64Round(instruction, Float64RoundMode.Floor, out error);
+                case "VFractF64":
+                    return TryEmitFloat64Fract(instruction, out error);
                 case "VCndmaskB32":
                 {
                     // dst = mask-bit(lane) ? src1 : src0. Sources are raw (no
@@ -132,6 +166,120 @@ public static partial class Gen5MslTranslator
             return TryEmitVectorValue(instruction, out error);
         }
 
+        private bool TryEmitVectorRelativeMove(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Destinations.Count != 1 ||
+                instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister ||
+                instruction.Sources.Count != 1)
+            {
+                error = $"invalid {instruction.Opcode} operands";
+                return false;
+            }
+
+            var relativeSource = instruction.Opcode is
+                "VMovrelsB32" or "VMovrelsdB32" or "VMovrelsd2B32";
+            if (relativeSource &&
+                instruction.Sources[0].Kind != Gen5OperandKind.VectorRegister)
+            {
+                error = $"{instruction.Opcode} expects a VGPR source base";
+                return false;
+            }
+
+            const uint m0Register = 124;
+            var splitOffsets = instruction.Opcode == "VMovrelsd2B32";
+            var sourceOffset = splitOffsets
+                ? $"(s[{m0Register}] & 0x3FFu)"
+                : $"s[{m0Register}]";
+            var destinationOffset = splitOffsets
+                ? $"((s[{m0Register}] >> 16u) & 0x3FFu)"
+                : $"s[{m0Register}]";
+            var source = relativeSource
+                ? LoadVectorRelative(instruction.Sources[0].Value, sourceOffset)
+                : Temp("uint", RawSource(instruction, 0));
+            var destination = instruction.Destinations[0].Value;
+            if (instruction.Opcode is
+                "VMovreldB32" or "VMovrelsdB32" or "VMovrelsd2B32")
+            {
+                StoreVectorRelative(destination, destinationOffset, source);
+            }
+            else
+            {
+                StoreVector(destination, source);
+            }
+
+            return true;
+        }
+
+        private bool TryEmitVector64Shift(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Destinations.Count == 0 ||
+                instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister ||
+                instruction.Sources.Count < 2)
+            {
+                error = $"invalid {instruction.Opcode} operands";
+                return false;
+            }
+
+            var destination = instruction.Destinations[0].Value;
+            var shift = Temp("uint", $"({RawSource(instruction, 0)}) & 63u");
+            var value = Temp("ulong", RawSource64(instruction, 1));
+            var shifted = instruction.Opcode switch
+            {
+                "VLshlrevB64" => Temp("ulong", $"{value} << {shift}"),
+                "VLshrrevB64" => Temp("ulong", $"{value} >> {shift}"),
+                _ => Temp(
+                    "ulong",
+                    $"as_type<ulong>(as_type<long>({value}) >> {shift})"),
+            };
+
+            StoreVector(destination, $"(uint){shifted}");
+            StoreVector(destination + 1, $"(uint)({shifted} >> 32u)");
+            return true;
+        }
+
+        private bool TryEmitVectorSwap(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Sources.Count != 2 ||
+                instruction.Destinations.Count != 2 ||
+                instruction.Sources.Any(item => item.Kind != Gen5OperandKind.VectorRegister) ||
+                instruction.Destinations.Any(item => item.Kind != Gen5OperandKind.VectorRegister))
+            {
+                error = $"invalid {instruction.Opcode} operands";
+                return false;
+            }
+
+            var sourceBase = instruction.Sources[0].Value;
+            var destinationBase = instruction.Sources[1].Value;
+            if (instruction.Opcode == "VSwapB32")
+            {
+                var sourceValue = Temp("uint", $"v[{sourceBase}]");
+                var destinationValue = Temp("uint", $"v[{destinationBase}]");
+                StoreVector(destinationBase, sourceValue);
+                StoreVector(sourceBase, destinationValue);
+                return true;
+            }
+
+            const uint m0Register = 124;
+            var sourceOffset = $"(s[{m0Register}] & 0x3FFu)";
+            var destinationOffset = $"((s[{m0Register}] >> 16u) & 0x3FFu)";
+            var sourceValueRelative = LoadVectorRelative(sourceBase, sourceOffset);
+            var destinationValueRelative = LoadVectorRelative(
+                destinationBase,
+                destinationOffset);
+            StoreVectorRelative(destinationBase, destinationOffset, sourceValueRelative);
+            StoreVectorRelative(sourceBase, sourceOffset, destinationValueRelative);
+            return true;
+        }
+
         private bool TryEmitVectorValue(
             Gen5ShaderInstruction instruction,
             out string error)
@@ -146,6 +294,10 @@ public static partial class Gen5MslTranslator
                 "VAddF32" => FloatResult(instruction, $"{F(instruction, 0)} + {F(instruction, 1)}"),
                 "VSubF32" => FloatResult(instruction, $"{F(instruction, 0)} - {F(instruction, 1)}"),
                 "VSubrevF32" => FloatResult(instruction, $"{F(instruction, 1)} - {F(instruction, 0)}"),
+                "VMulLegacyF32" => EmitLegacyFloatMultiply(instruction),
+                "VMacLegacyF32" => EmitLegacyFloatMultiplyAccumulate(instruction, destination),
+                "VMadLegacyF32" => EmitLegacyFloatMad(instruction),
+                "VMullitF32" => EmitMullitF32(instruction),
                 "VMulF32" => FloatResult(instruction, $"{F(instruction, 0)} * {F(instruction, 1)}"),
                 "VMinF32" => FloatResult(instruction, $"fmin({F(instruction, 0)}, {F(instruction, 1)})"),
                 "VMaxF32" => FloatResult(instruction, $"fmax({F(instruction, 0)}, {F(instruction, 1)})"),
@@ -162,9 +314,14 @@ public static partial class Gen5MslTranslator
                 "VFractF32" => FloatResult(instruction, $"fract({F(instruction, 0)})"),
                 "VSqrtF32" => FloatResult(instruction, $"sqrt({F(instruction, 0)})"),
                 "VRsqF32" => FloatResult(instruction, $"rsqrt({F(instruction, 0)})"),
-                "VRcpF32" or "VRcpIflagF32" => FloatResult(instruction, $"(1.0f / {F(instruction, 0)})"),
-                "VLogF32" => FloatResult(instruction, $"log2({F(instruction, 0)})"),
-                "VExpF32" => FloatResult(instruction, $"exp2({F(instruction, 0)})"),
+                 "VRcpF32" or "VRcpIflagF32" => FloatResult(instruction, $"(1.0f / {F(instruction, 0)})"),
+                 "VLogF32" => FloatResult(instruction, $"log2({F(instruction, 0)})"),
+                 "VExpF32" => FloatResult(instruction, $"exp2({F(instruction, 0)})"),
+                 "VFrexpExpI32F32" => EmitFrexpExponentF32(instruction),
+                 "VFrexpMantF32" => FloatResult(
+                     instruction,
+                     $"as_type<float>({EmitFrexpMantissaF32(instruction)})"),
+                 "VFrexpExpI32F64" => EmitFrexpExponentF64(instruction),
                 // GCN sin/cos take revolutions; mirror the SPIR-V Tau prescale.
                 "VSinF32" => FloatResult(instruction, $"sin({F(instruction, 0)} * {TauLiteral})"),
                 "VCosF32" => FloatResult(instruction, $"cos({F(instruction, 0)} * {TauLiteral})"),
@@ -178,10 +335,13 @@ public static partial class Gen5MslTranslator
                     FloatResult(instruction, $"fmax(fmin({F(instruction, 0)}, {F(instruction, 1)}), fmin(fmax({F(instruction, 0)}, {F(instruction, 1)}), {F(instruction, 2)}))"),
 
                 // ---- conversions ----
-                "VCvtF32I32" => FloatResult(instruction, $"(float)as_type<int>({RawSource(instruction, 0)})"),
-                "VCvtF32U32" => FloatResult(instruction, $"(float)({RawSource(instruction, 0)})"),
-                "VCvtU32F32" => $"(uint)({F(instruction, 0)})",
-                "VCvtI32F32" => AsUInt($"(int)({F(instruction, 0)})"),
+                 "VCvtF32I32" => FloatResult(instruction, $"(float)as_type<int>({RawSource(instruction, 0)})"),
+                 "VCvtF32U32" => FloatResult(instruction, $"(float)({RawSource(instruction, 0)})"),
+                 "VCvtF32F64" => EmitFloat32FromF64(instruction),
+                 "VCvtU32F32" => $"(uint)({F(instruction, 0)})",
+                 "VCvtI32F32" => AsUInt($"(int)({F(instruction, 0)})"),
+                 "VCvtI32F64" => EmitFloat64ToInt32(instruction, signed: true),
+                 "VCvtU32F64" => EmitFloat64ToInt32(instruction, signed: false),
                 // RPI rounds toward positive infinity; FLR toward negative.
                 "VCvtRpiI32F32" => AsUInt($"(int)ceil({F(instruction, 0)})"),
                 "VCvtFlrI32F32" => AsUInt($"(int)floor({F(instruction, 0)})"),
@@ -203,18 +363,32 @@ public static partial class Gen5MslTranslator
                     $"pack_float_to_snorm2x16(float2({F(instruction, 0)}, {F(instruction, 1)}))",
                 "VCvtPknormU16F32" =>
                     $"pack_float_to_unorm2x16(float2({F(instruction, 0)}, {F(instruction, 1)}))",
+                "VCvtPkU16U32" or "VCvtPkI16I32" =>
+                    $"((({RawSource(instruction, 0)}) & 0xFFFFu) | ((({RawSource(instruction, 1)}) & 0xFFFFu) << 16))",
+                "VDot2cF32F16" => EmitDot2cF32F16(instruction, destination),
+                "VSadU8" or "VSadHiU8" or "VSadU16" or "VSadU32" =>
+                    EmitUnsignedSad(instruction),
+                "VMsadU8" => EmitMaskedUnsignedSadU8(instruction),
 
                 // ---- integer arithmetic ----
                 "VAddU32" or "VAddI32" =>
                     $"(({RawSource(instruction, 0)}) + ({RawSource(instruction, 1)}))",
+                "VAddNcU32" or "VAddNcI32" =>
+                    $"(({RawSource(instruction, 0)}) + ({RawSource(instruction, 1)}))",
                 "VSubU32" or "VSubI32" =>
                     $"(({RawSource(instruction, 0)}) - ({RawSource(instruction, 1)}))",
+                "VSubNcU32" or "VSubNcI32" =>
+                    $"(({RawSource(instruction, 0)}) - ({RawSource(instruction, 1)}))",
                 "VSubrevU32" or "VSubrevI32" =>
+                    $"(({RawSource(instruction, 1)}) - ({RawSource(instruction, 0)}))",
+                "VSubrevNcU32" =>
                     $"(({RawSource(instruction, 1)}) - ({RawSource(instruction, 0)}))",
                 // The SPIR-V translator treats the U24 multiply as a full 32-bit
                 // multiply (only the Hi/Mad forms mask); mirror it exactly.
                 "VMulLoU32" or "VMulLoI32" or "VMulU32U24" =>
                     $"(({RawSource(instruction, 0)}) * ({RawSource(instruction, 1)}))",
+                "VMulI32I24" => EmitSigned24Product(instruction, high: false),
+                "VMulHiI32I24" => EmitSigned24Product(instruction, high: true),
                 "VMulHiU32" =>
                     $"mulhi({RawSource(instruction, 0)}, {RawSource(instruction, 1)})",
                 "VMulHiU32U24" =>
@@ -223,8 +397,9 @@ public static partial class Gen5MslTranslator
                     AsUInt($"mulhi(as_type<int>({RawSource(instruction, 0)}), as_type<int>({RawSource(instruction, 1)}))"),
                 "VMadU32U24" =>
                     $"(((({RawSource(instruction, 0)}) & 0xFFFFFFu) * (({RawSource(instruction, 1)}) & 0xFFFFFFu)) + ({RawSource(instruction, 2)}))",
-                "VMadU32U16" =>
-                    $"(((({RawSource(instruction, 0)}) & 0xFFFFu) * (({RawSource(instruction, 1)}) & 0xFFFFu)) + ({RawSource(instruction, 2)}))",
+                "VMadI32I24" => EmitSigned24Mad(instruction),
+                "VMadU32U16" or "VMadI32I16" =>
+                    EmitMixedWidthMad16(instruction),
                 "VAdd3U32" =>
                     $"(({RawSource(instruction, 0)}) + ({RawSource(instruction, 1)}) + ({RawSource(instruction, 2)}))",
                 "VAddLshlU32" =>
@@ -249,6 +424,65 @@ public static partial class Gen5MslTranslator
                     $"max(min({RawSource(instruction, 0)}, {RawSource(instruction, 1)}), min(max({RawSource(instruction, 0)}, {RawSource(instruction, 1)}), {RawSource(instruction, 2)}))",
                 "VMed3I32" =>
                     AsUInt($"max(min(as_type<int>({RawSource(instruction, 0)}), as_type<int>({RawSource(instruction, 1)})), min(max(as_type<int>({RawSource(instruction, 0)}), as_type<int>({RawSource(instruction, 1)})), as_type<int>({RawSource(instruction, 2)})))"),
+                "VFmaF16" or
+                "VMin3F16" or "VMin3I16" or "VMin3U16" or
+                "VMax3F16" or "VMax3I16" or "VMax3U16" or
+                "VMed3F16" or "VMed3I16" or "VMed3U16" =>
+                    EmitVop3Half(instruction, destination),
+                "VAddNcU16" or "VSubNcU16" or "VMulLoU16" or
+                "VLshrrevB16" or "VAshrrevI16" or
+                "VMaxU16" or "VMaxI16" or "VMinU16" or "VMinI16" or
+                "VAddNcI16" or "VSubNcI16" or "VLshlrevB16" =>
+                    EmitVop3Integer16(instruction, destination),
+                "VMadU16" or "VMadI16" =>
+                    EmitVop3Integer16(instruction, destination),
+                "VDivFixupF16" => EmitDivFixupF16(instruction, destination),
+                "VDivFmasF32" => EmitDivFmasF32(instruction),
+                "VPackB32F16" or "VCvtPknormI16F16" or "VCvtPknormU16F16" =>
+                    EmitVop3HalfPack(instruction),
+                "VPkMadI16" or "VPkMulLoU16" or "VPkAddI16" or "VPkSubI16" or
+                "VPkLshlrevB16" or "VPkLshrrevB16" or "VPkAshrrevI16" or
+                "VPkMaxI16" or "VPkMinI16" or "VPkMadU16" or "VPkAddU16" or
+                "VPkSubU16" or "VPkMaxU16" or "VPkMinU16" =>
+                    EmitPackedInteger16(instruction),
+                "VDot2I32I16" or "VDot2U32U16" or
+                "VDot4I32I8" or "VDot4U32U8" or
+                "VDot8I32I4" or "VDot8U32U4" =>
+                    EmitPackedIntegerDot(instruction),
+                "VDot2F32F16" => EmitPackedFloatDot(instruction),
+                "VPkAddF16" or "VPkMulF16" or "VPkMinF16" or
+                "VPkMaxF16" or "VPkFmaF16" =>
+                    EmitPackedF16(instruction),
+                "VFmaMixF32" or "VFmaMixloF16" or "VFmaMixhiF16" =>
+                    EmitFmaMix(instruction, destination),
+                "VAddF16" or "VSubF16" or "VSubrevF16" or "VMulF16" or
+                "VFmacF16" or "VFmaMkF16" or "VFmaAkF16" or
+                "VMaxF16" or "VMinF16" or "VLdexpF16" or
+                "VRcpF16" or "VSqrtF16" or "VRsqF16" or
+                "VLogF16" or "VExpF16" or "VFrexpMantF16" or
+                "VFloorF16" or "VCeilF16" or "VTruncF16" or
+                "VRndneF16" or "VFractF16" or "VSinF16" or "VCosF16" =>
+                    EmitScalarF16(instruction, destination),
+                "VCvtF16U16" or "VCvtF16I16" or
+                "VCvtU16F16" or "VCvtI16F16" =>
+                    EmitScalarF16Conversion(instruction, destination),
+                "VFrexpExpI16F16" =>
+                    MergeScalar16Result(
+                        instruction,
+                        destination,
+                        EmitHalfFrexpExponentBits(EmitScalarF16OperandBits(instruction, 0))),
+                "VCvtNormI16F16" =>
+                    MergeScalar16Result(
+                        instruction,
+                        destination,
+                        $"pack_float_to_snorm2x16(float2(float({EmitScalarF16Operand(instruction, 0)}), 0.0f))"),
+                "VCvtNormU16F16" =>
+                    MergeScalar16Result(
+                        instruction,
+                        destination,
+                        $"pack_float_to_unorm2x16(float2(float({EmitScalarF16Operand(instruction, 0)}), 0.0f))"),
+                "VSatPkU8I16" => EmitSatPkU8I16(instruction),
+                "VPkFmacF16" => EmitPackedF16Accumulate(instruction, destination),
 
                 // ---- bitwise ----
                 "VAndB32" => $"(({RawSource(instruction, 0)}) & ({RawSource(instruction, 1)}))",
@@ -258,10 +492,20 @@ public static partial class Gen5MslTranslator
                 "VNotB32" => $"~({RawSource(instruction, 0)})",
                 "VAndOrB32" =>
                     $"((({RawSource(instruction, 0)}) & ({RawSource(instruction, 1)})) | ({RawSource(instruction, 2)}))",
-                "VOr3U32" =>
+                "VLerpU8" => EmitLerpU8(instruction),
+                "VXadU32" =>
+                    $"((({RawSource(instruction, 0)}) ^ ({RawSource(instruction, 1)})) + ({RawSource(instruction, 2)}))",
+                "VPermB32" =>
+                    $"(sharpemu_perm_byte({RawSource(instruction, 0)}, {RawSource(instruction, 1)}, ({RawSource(instruction, 2)}) & 0xffu) | " +
+                    $"(sharpemu_perm_byte({RawSource(instruction, 0)}, {RawSource(instruction, 1)}, (({RawSource(instruction, 2)}) >> 8u) & 0xffu) << 8u) | " +
+                    $"(sharpemu_perm_byte({RawSource(instruction, 0)}, {RawSource(instruction, 1)}, (({RawSource(instruction, 2)}) >> 16u) & 0xffu) << 16u) | " +
+                    $"(sharpemu_perm_byte({RawSource(instruction, 0)}, {RawSource(instruction, 1)}, (({RawSource(instruction, 2)}) >> 24u) & 0xffu) << 24u))",
+                "VOr3U32" or "VOr3B32" =>
                     $"(({RawSource(instruction, 0)}) | ({RawSource(instruction, 1)}) | ({RawSource(instruction, 2)}))",
-                "VLshlOrU32" =>
+                "VLshlOrU32" or "VLshlOrB32" =>
                     $"((({RawSource(instruction, 0)}) << (({RawSource(instruction, 1)}) & 31u)) | ({RawSource(instruction, 2)}))",
+                "VXor3B32" =>
+                    $"(({RawSource(instruction, 0)}) ^ ({RawSource(instruction, 1)}) ^ ({RawSource(instruction, 2)}))",
                 "VLshlB32" => $"(({RawSource(instruction, 0)}) << (({RawSource(instruction, 1)}) & 31u))",
                 "VLshlrevB32" => $"(({RawSource(instruction, 1)}) << (({RawSource(instruction, 0)}) & 31u))",
                 "VLshrB32" => $"(({RawSource(instruction, 0)}) >> (({RawSource(instruction, 1)}) & 31u))",
@@ -274,12 +518,18 @@ public static partial class Gen5MslTranslator
                     $"extract_bits({RawSource(instruction, 0)}, ({RawSource(instruction, 1)}) & 31u, ({RawSource(instruction, 2)}) & 31u)",
                 "VBfiB32" =>
                     $"((({RawSource(instruction, 0)}) & ({RawSource(instruction, 1)})) | (~({RawSource(instruction, 0)}) & ({RawSource(instruction, 2)})))",
+                "VAlignbitB32" =>
+                    $"uint(((ulong({RawSource(instruction, 0)}) << 32ul) | ulong({RawSource(instruction, 1)})) >> ulong(({RawSource(instruction, 2)}) & 31u))",
+                "VAlignbyteB32" =>
+                    $"((({RawSource(instruction, 2)}) & 31u) >= 8u ? 0u : uint(((ulong({RawSource(instruction, 0)}) << 32ul) | ulong({RawSource(instruction, 1)})) >> ulong((({RawSource(instruction, 2)}) & 31u) * 8u)))",
                 "VBfmB32" =>
                     $"(((1u << (({RawSource(instruction, 0)}) & 31u)) - 1u) << (({RawSource(instruction, 1)}) & 31u))",
                 "VBfrevB32" => $"reverse_bits({RawSource(instruction, 0)})",
                 "VBcntU32B32" => $"(popcount({RawSource(instruction, 0)}) + ({RawSource(instruction, 1)}))",
                 "VFfblB32" =>
                     $"(({RawSource(instruction, 0)}) == 0u ? 0xFFFFFFFFu : (uint)ctz({RawSource(instruction, 0)}))",
+                "VFfbhU32" => EmitFfbh(instruction, signed: false),
+                "VFfbhI32" => EmitFfbh(instruction, signed: true),
 
                 // ---- wave / lane ----
                 // mbcnt reads the mask dword the guest passes (no cross-lane
@@ -393,6 +643,161 @@ public static partial class Gen5MslTranslator
             return true;
         }
 
+        // V_SAD_* uses unsigned component differences and accumulates into src2.
+        // A VOP3 integer clamp saturates an overflowing addition to UINT_MAX.
+        private string EmitUnsignedSad(Gen5ShaderInstruction instruction)
+        {
+            var source0 = Temp("uint", RawSource(instruction, 0));
+            var source1 = Temp("uint", RawSource(instruction, 1));
+            var source2 = Temp("uint", RawSource(instruction, 2));
+            var clamp = instruction.Control is Gen5Vop3Control { Clamp: true };
+
+            string Component(string source, int shift, string mask) =>
+                shift == 0
+                    ? $"({source} & {mask})"
+                    : $"(({source} >> {shift}) & {mask})";
+
+            string AbsDiff(string left, string right) =>
+                $"(max({left}, {right}) - min({left}, {right}))";
+
+            string SumComponents(int componentBits, int componentCount)
+            {
+                var mask = componentBits == 8 ? "0xFFu" : "0xFFFFu";
+                var terms = new string[componentCount];
+                for (var component = 0; component < componentCount; component++)
+                {
+                    var left = Component(source0, component * componentBits, mask);
+                    var right = Component(source1, component * componentBits, mask);
+                    terms[component] = AbsDiff(left, right);
+                }
+
+                return Temp("uint", string.Join(" + ", terms));
+            }
+
+            var difference = instruction.Opcode switch
+            {
+                "VSadU8" => SumComponents(8, 4),
+                "VSadHiU8" => Temp("uint", $"{SumComponents(8, 4)} << 16"),
+                "VSadU16" => SumComponents(16, 2),
+                "VSadU32" => Temp("uint", AbsDiff(source0, source1)),
+                _ => "0u",
+            };
+            var sum = Temp("uint", $"{source2} + {difference}");
+            return clamp ? $"({sum} < {source2} ? 0xFFFFFFFFu : {sum})" : sum;
+        }
+
+        // V_MSAD_U8 copies S2 and conditionally accumulates four unsigned byte
+        // absolute differences.  A zero byte in S1 suppresses that component.
+        private string EmitMaskedUnsignedSadU8(Gen5ShaderInstruction instruction)
+        {
+            var source0 = Temp("uint", RawSource(instruction, 0));
+            var source1 = Temp("uint", RawSource(instruction, 1));
+            var result = Temp("uint", RawSource(instruction, 2));
+
+            for (var component = 0; component < 4; component++)
+            {
+                var shift = component * 8;
+                var left = Temp(
+                    "uint",
+                    $"(({source0} >> {shift}) & 0xFFu)");
+                var right = Temp(
+                    "uint",
+                    $"(({source1} >> {shift}) & 0xFFu)");
+                var difference = Temp(
+                    "uint",
+                    $"(max({left}, {right}) - min({left}, {right}))");
+                result = Temp(
+                    "uint",
+                    $"{result} + ({right} == 0u ? 0u : {difference})");
+            }
+
+            return result;
+        }
+
+        private bool TryEmitPackedSad(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Destinations.Count == 0 ||
+                instruction.Destinations[0].Kind != Gen5OperandKind.VectorRegister ||
+                instruction.Sources.Count < 3)
+            {
+                error = $"invalid {instruction.Opcode} operands";
+                return false;
+            }
+
+            var destination = instruction.Destinations[0].Value;
+            var source0 = Temp("ulong", RawSource64(instruction, 0));
+            var source1 = Temp("uint", RawSource(instruction, 1));
+            var masked = instruction.Opcode is "VMqsadPkU16U8" or "VMqsadU32U8";
+
+            string Source2Dword(int index) => instruction.Sources[2].Kind switch
+            {
+                Gen5OperandKind.VectorRegister => $"v[{instruction.Sources[2].Value + (uint)index}]",
+                Gen5OperandKind.ScalarRegister => $"s[{instruction.Sources[2].Value + (uint)index}]",
+                _ when index == 0 => RawSource(instruction, 2),
+                _ => "0u",
+            };
+
+            string Source0Chunk(int index) => Temp(
+                "uint",
+                $"(uint)({source0} >> {(uint)(index * 8)}u)");
+
+            string ByteSad(string source0Chunk)
+            {
+                var terms = new string[4];
+                for (var component = 0; component < 4; component++)
+                {
+                    var shift = component * 8;
+                    var left = Temp(
+                        "uint",
+                        $"(({source0Chunk} >> {shift}) & 0xFFu)");
+                    var right = Temp(
+                        "uint",
+                        $"(({source1} >> {shift}) & 0xFFu)");
+                    var difference =
+                        $"(max({left}, {right}) - min({left}, {right}))";
+                    terms[component] = masked
+                        ? $"({right} == 0u ? 0u : {difference})"
+                        : difference;
+                }
+
+                return Temp("uint", string.Join(" + ", terms));
+            }
+
+            if (instruction.Opcode is "VQsadPkU16U8" or "VMqsadPkU16U8")
+            {
+                var source2 = Temp("ulong", RawSource64(instruction, 2));
+                var packed = new string[4];
+                for (var component = 0; component < 4; component++)
+                {
+                    var accumulator = Temp(
+                        "uint",
+                        $"(uint)({source2} >> {(uint)(component * 16)}u) & 0xFFFFu");
+                    packed[component] = Temp(
+                        "uint",
+                        $"(({accumulator} + {ByteSad(Source0Chunk(component))}) & 0xFFFFu)");
+                }
+
+                var low = Temp("uint", $"{packed[0]} | ({packed[1]} << 16)");
+                var high = Temp("uint", $"{packed[2]} | ({packed[3]} << 16)");
+                StoreVector(destination + 1, high);
+                StoreVector(destination, low);
+                return true;
+            }
+
+            for (var component = 0; component < 4; component++)
+            {
+                var result = Temp(
+                    "uint",
+                    $"{Source2Dword(component)} + {ByteSad(Source0Chunk(component))}");
+                StoreVector(destination + (uint)component, result);
+            }
+
+            return true;
+        }
+
         private string EmitCvtPkU8F32(Gen5ShaderInstruction instruction)
         {
             var converted = Temp("uint", $"(uint)({F(instruction, 0)})");
@@ -412,6 +817,1425 @@ public static partial class Gen5MslTranslator
                 "float",
                 $"as_type<float>(as_type<uint>({F(instruction, 1)}) & 0xFFFFE000u)");
             return $"(((uint)as_type<ushort>(half({first}))) | (((uint)as_type<ushort>(half({second}))) << 16))";
+        }
+
+        private string EmitDot2cF32F16(
+            Gen5ShaderInstruction instruction,
+            uint destination)
+        {
+            // Materialize each packed source once. DPP remapping can involve
+            // threadgroup synchronization, so re-emitting RawSource(src0) is
+            // not merely redundant text generation.
+            var source0 = Temp("uint", RawSource(instruction, 0));
+            var source1 = Temp("uint", RawSource(instruction, 1));
+            var source0Low = $"float(as_type<half>((ushort)({source0} & 0xFFFFu)))";
+            var source0High = $"float(as_type<half>((ushort)({source0} >> 16)))";
+            var source1Low = $"float(as_type<half>((ushort)({source1} & 0xFFFFu)))";
+            var source1High = $"float(as_type<half>((ushort)({source1} >> 16)))";
+            return FloatResult(
+                instruction,
+                $"as_type<float>(v[{destination}]) + " +
+                $"{source0Low} * {source1Low} + {source0High} * {source1High}");
+        }
+
+        private string EmitScalarF16(Gen5ShaderInstruction instruction, uint destination)
+        {
+            var source0 = EmitScalarF16Operand(instruction, 0);
+            var source1 = instruction.Sources.Count > 1
+                ? EmitScalarF16Operand(instruction, 1)
+                : string.Empty;
+            string value = instruction.Opcode switch
+            {
+                "VAddF16" => $"({source0} + {source1})",
+                "VSubF16" => $"({source0} - {source1})",
+                "VSubrevF16" => $"({source1} - {source0})",
+                "VMulF16" => $"({source0} * {source1})",
+                "VFmacF16" =>
+                    $"fma({source0}, {source1}, {EmitScalarF16Destination(instruction, destination)})",
+                "VFmaMkF16" or "VFmaAkF16" =>
+                    $"fma({source0}, {source1}, {EmitScalarF16Operand(instruction, 2)})",
+                "VMaxF16" => $"fmax({source0}, {source1})",
+                "VMinF16" => $"fmin({source0}, {source1})",
+                "VLdexpF16" =>
+                    $"half(ldexp(float({source0}), int(short({EmitScalarF16SourceBits(instruction, 1)}))))",
+                "VRcpF16" => $"half(1.0f / float({source0}))",
+                "VSqrtF16" => $"half(sqrt(float({source0})))",
+                "VRsqF16" => $"half(1.0f / sqrt(float({source0})))",
+                "VLogF16" => $"half(log2(float({source0})))",
+                "VExpF16" => $"half(exp2(float({source0})))",
+                "VFrexpMantF16" =>
+                    $"as_type<half>((ushort)({EmitHalfFrexpMantissaBits(EmitScalarF16OperandBits(instruction, 0))}))",
+                "VFloorF16" => $"half(floor(float({source0})))",
+                "VCeilF16" => $"half(ceil(float({source0})))",
+                "VTruncF16" => $"half(trunc(float({source0})))",
+                "VRndneF16" => $"half(rint(float({source0})))",
+                "VFractF16" => $"half(fract(float({source0})))",
+                "VSinF16" => $"half(sin(float({source0}) * {TauLiteral}))",
+                "VCosF16" => $"half(cos(float({source0}) * {TauLiteral}))",
+                _ => source0,
+            };
+
+            return FinishScalarF16Result(instruction, destination, value);
+        }
+
+        private string FinishScalarF16Result(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            string value)
+        {
+            var (outputModifier, clamp) = instruction.Control switch
+            {
+                Gen5Vop3Control control => (control.OutputModifier, control.Clamp),
+                Gen5SdwaControl control => (control.OutputModifier, control.Clamp),
+                _ => (0u, false),
+            };
+            value = outputModifier switch
+            {
+                1 => $"(({value}) * half(2.0f))",
+                2 => $"(({value}) * half(4.0f))",
+                3 => $"(({value}) * half(0.5f))",
+                _ => value,
+            };
+            if (clamp)
+            {
+                value = $"clamp({value}, half(0.0f), half(1.0f))";
+            }
+
+            var halfBits = Temp("uint", $"(uint)as_type<ushort>(half({value}))");
+            return MergeScalar16Result(instruction, destination, halfBits);
+        }
+
+        private string MergeScalar16Result(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            string halfBits)
+        {
+            halfBits = Temp("uint", $"(({halfBits}) & 0xFFFFu)");
+            if (instruction.Control is Gen5Vop3Control vop3)
+            {
+                return (vop3.OperandSelect & 8) == 0
+                    ? $"((v[{destination}] & 0xFFFF0000u) | {halfBits})"
+                    : $"((v[{destination}] & 0x0000FFFFu) | ({halfBits} << 16))";
+            }
+
+            // Native 16-bit VOP1/VOP2 operations define the high half as zero.
+            return halfBits;
+        }
+
+        private string EmitScalarF16Conversion(
+            Gen5ShaderInstruction instruction,
+            uint destination)
+        {
+            if (instruction.Opcode is "VCvtF16U16" or "VCvtF16I16")
+            {
+                var sourceBits = EmitScalarF16SourceBits(instruction, 0);
+                var value = instruction.Opcode == "VCvtF16I16"
+                    ? $"half((float)as_type<short>((ushort)({sourceBits})))"
+                    : $"half((float)(ushort)({sourceBits}))";
+                return FinishScalarF16Result(instruction, destination, value);
+            }
+
+            var source = EmitScalarF16Operand(instruction, 0);
+            var signed = instruction.Opcode == "VCvtI16F16";
+            var bounded = Temp(
+                "float",
+                $"(isnan(float({source})) ? 0.0f : " +
+                $"clamp(float({source}), {(signed ? "-32768.0f" : "0.0f")}, " +
+                $"{(signed ? "32767.0f" : "65535.0f")}))");
+            var integer = signed
+                ? $"((uint)(ushort)(short)trunc({bounded}))"
+                : $"((uint)(ushort)trunc({bounded}))";
+            return MergeScalar16Result(instruction, destination, integer);
+        }
+
+        private string EmitHalfFrexpMantissaBits(string halfBits)
+        {
+            var bits = Temp("uint", $"(({halfBits}) & 0xFFFFu)");
+            var sign = Temp("uint", $"({bits} & 0x8000u)");
+            var exponent = Temp("uint", $"({bits} & 0x7C00u)");
+            var fraction = Temp("uint", $"({bits} & 0x03FFu)");
+            var normalizedFraction = Temp(
+                "uint",
+                $"(({fraction} << (clz({fraction}) - 21u)) & 0x03FFu)");
+            return
+                $"(({exponent} == 0x7C00u || ({exponent} == 0u && {fraction} == 0u)) " +
+                $"? {bits} : ({sign} | 0x3800u | ({exponent} == 0u ? {normalizedFraction} : {fraction})))";
+        }
+
+        private string EmitHalfFrexpExponentBits(string halfBits)
+        {
+            var bits = Temp("uint", $"(({halfBits}) & 0xFFFFu)");
+            var exponent = Temp("uint", $"(({bits} >> 10u) & 0x1Fu)");
+            var fraction = Temp("uint", $"({bits} & 0x03FFu)");
+            var normalExponent = Temp("uint", $"({exponent} - 14u)");
+            var subnormalExponent = Temp("uint", $"(8u - clz({fraction}))");
+            return
+                $"(({exponent} == 0x1Fu || ({exponent} == 0u && {fraction} == 0u)) " +
+                $"? 0u : (({exponent} == 0u ? {subnormalExponent} : {normalExponent}) & 0xFFFFu))";
+        }
+
+        private string EmitFrexpExponentF32(Gen5ShaderInstruction instruction)
+        {
+            var bits = Temp("uint", $"as_type<uint>({F(instruction, 0)})");
+            var exponent = Temp("uint", $"(({bits} >> 23u) & 0xFFu)");
+            var fraction = Temp("uint", $"({bits} & 0x007FFFFFu)");
+            var msb = Temp("uint", $"(31u - clz({fraction}))");
+            var normalExponent = Temp("int", $"(int({exponent}) - 126)");
+            var subnormalExponent = Temp("int", $"(int({msb}) - 148)");
+            return Temp(
+                "uint",
+                $"as_type<uint>({exponent} == 0xFFu ? 0 : " +
+                $"({exponent} == 0u ? ({fraction} == 0u ? 0 : {subnormalExponent}) : {normalExponent}))");
+        }
+
+        private string EmitFrexpMantissaF32(Gen5ShaderInstruction instruction)
+        {
+            var bits = Temp("uint", $"as_type<uint>({F(instruction, 0)})");
+            var sign = Temp("uint", $"({bits} & 0x80000000u)");
+            var exponent = Temp("uint", $"({bits} & 0x7F800000u)");
+            var fraction = Temp("uint", $"({bits} & 0x007FFFFFu)");
+            var msb = Temp("uint", $"(31u - clz({fraction}))");
+            var shift = Temp("uint", $"(23u - {msb})");
+            var normalizedFraction = Temp(
+                "uint",
+                $"(({fraction} << {shift}) & 0x007FFFFFu)");
+            var normal = Temp("uint", $"{sign} | 0x3F000000u | {fraction}");
+            var subnormal = Temp("uint", $"{sign} | 0x3F000000u | {normalizedFraction}");
+            var finite = Temp(
+                "uint",
+                $"{exponent} == 0u ? ({fraction} == 0u ? {bits} : {subnormal}) : {normal}");
+            return Temp(
+                "uint",
+                $"{exponent} == 0x7F800000u ? {bits} : {finite}");
+        }
+
+        private string EmitFrexpExponentF64(Gen5ShaderInstruction instruction)
+        {
+            var bits = Temp("ulong", Float64SourceBits(instruction, 0));
+            var exponent = Temp("uint", $"(uint)(({bits} >> 52u) & 0x7FFul)");
+            var fraction = Temp("ulong", $"({bits} & 0x000FFFFFFFFFFFFFul)");
+            var low = Temp("uint", $"(uint){fraction}");
+            var high = Temp("uint", $"(uint)({fraction} >> 32u)");
+            var highMsb = Temp("int", $"(31 - int(clz({high})))");
+            var lowMsb = Temp("int", $"(31 - int(clz({low})))");
+            var msb = Temp("int", $"{high} != 0u ? ({highMsb} + 32) : {lowMsb}");
+            var normalExponent = Temp("int", $"(int({exponent}) - 1022)");
+            var subnormalExponent = Temp("int", $"({msb} - 1073)");
+            return Temp(
+                "uint",
+                $"as_type<uint>({exponent} == 0x7FFu ? 0 : " +
+                $"({exponent} == 0u ? ({fraction} == 0ul ? 0 : {subnormalExponent}) : {normalExponent}))");
+        }
+
+        private bool TryEmitFrexpMantissaF64(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            var destination = DestinationVector(instruction);
+            var bits = Temp("ulong", Float64SourceBits(instruction, 0));
+            var sign = Temp("ulong", $"({bits} & 0x8000000000000000ul)");
+            var exponent = Temp("ulong", $"({bits} & 0x7FF0000000000000ul)");
+            var fraction = Temp("ulong", $"({bits} & 0x000FFFFFFFFFFFFFul)");
+            var low = Temp("uint", $"(uint){fraction}");
+            var high = Temp("uint", $"(uint)({fraction} >> 32u)");
+            var highMsb = Temp("int", $"(31 - int(clz({high})))");
+            var lowMsb = Temp("int", $"(31 - int(clz({low})))");
+            var msb = Temp("int", $"{high} != 0u ? ({highMsb} + 32) : {lowMsb}");
+            var safeMsb = Temp("uint", $"({fraction} == 0ul ? 0u : (uint){msb})");
+            var shift = Temp("uint", $"(52u - {safeMsb})");
+            var normalizedFraction = Temp(
+                "ulong",
+                $"(({fraction} << {shift}) & 0x000FFFFFFFFFFFFFul)");
+            var normal = Temp(
+                "ulong",
+                $"{sign} | 0x3FE0000000000000ul | {fraction}");
+            var subnormal = Temp(
+                "ulong",
+                $"{sign} | 0x3FE0000000000000ul | {normalizedFraction}");
+            var finite = Temp(
+                "ulong",
+                $"{exponent} == 0ul ? ({fraction} == 0ul ? {bits} : {subnormal}) : {normal}");
+            var result = Temp(
+                "ulong",
+                $"{exponent} == 0x7FF0000000000000ul ? {bits} : {finite}");
+            StoreVector(destination, $"(uint){result}");
+            StoreVector(destination + 1, $"(uint)({result} >> 32u)");
+            return true;
+        }
+
+        private string EmitFloat64ToInt32(
+            Gen5ShaderInstruction instruction,
+            bool signed)
+        {
+            // Match RDNA2's truncating/saturating conversion without requiring
+            // Metal shader-float64 support.  All intermediate work stays in the
+            // IEEE-754 bit representation.
+            var bits = Temp("ulong", Float64SourceBits(instruction, 0));
+            var sign = Temp("ulong", $"({bits} & 0x8000000000000000ul)");
+            var exponent = Temp("uint", $"(uint)(({bits} >> 52u) & 0x7FFul)");
+            var fraction = Temp("ulong", $"({bits} & 0x000FFFFFFFFFFFFFul)");
+            var isNan = Temp(
+                "bool",
+                $"({exponent} == 0x7FFu && {fraction} != 0ul)");
+            var isNegative = Temp("bool", $"{sign} != 0ul");
+            var significand = Temp(
+                "ulong",
+                $"({fraction} | 0x0010000000000000ul)");
+            var leftShift = Temp(
+                "uint",
+                $"({exponent} >= 1075u ? min({exponent} - 1075u, 63u) : 0u)");
+            var rightShift = Temp(
+                "uint",
+                $"({exponent} < 1075u ? min(1075u - {exponent}, 63u) : 0u)");
+            var leftMagnitude = Temp("ulong", $"{significand} << {leftShift}");
+            var rightMagnitude = Temp("ulong", $"{significand} >> {rightShift}");
+            var magnitude = Temp(
+                "ulong",
+                $"{exponent} >= 1075u ? {leftMagnitude} : {rightMagnitude}");
+            var truncated = Temp("uint", $"(uint){magnitude}");
+            var inRange = Temp("bool", $"{exponent} < 1054u");
+            string finite;
+            if (signed)
+            {
+                var signedMagnitude = Temp("uint", $"0u - {truncated}");
+                var normal = Temp(
+                    "uint",
+                    $"{isNegative} ? {signedMagnitude} : {truncated}");
+                var saturated = Temp(
+                    "uint",
+                    $"{isNegative} ? 0x80000000u : 0x7FFFFFFFu");
+                finite = Temp(
+                    "uint",
+                    $"{inRange} ? {normal} : {saturated}");
+            }
+            else
+            {
+                var normal = Temp(
+                    "uint",
+                    $"{isNegative} ? 0u : {truncated}");
+                var saturated = Temp(
+                    "uint",
+                    $"{isNegative} ? 0u : 0xFFFFFFFFu");
+                finite = Temp(
+                    "uint",
+                    $"{inRange} ? {normal} : {saturated}");
+            }
+
+            return Temp("uint", $"{isNan} ? 0u : {finite}");
+        }
+
+        private bool TryEmitFloat64FromInt32(
+            Gen5ShaderInstruction instruction,
+            bool signed,
+            out string error)
+        {
+            error = string.Empty;
+            var destination = DestinationVector(instruction);
+            var source = Temp("uint", RawSource(instruction, 0));
+            var negative = signed
+                ? Temp("bool", $"({source} & 0x80000000u) != 0u")
+                : "false";
+            var magnitude = signed
+                ? Temp("uint", $"{negative} ? (0u - {source}) : {source}")
+                : Temp("uint", source);
+            var isZero = Temp("bool", $"{magnitude} == 0u");
+            var msb = Temp("uint", $"(uint)(31 - int(clz({magnitude})))");
+            var safeMsb = Temp("uint", $"{isZero} ? 0u : {msb}");
+            var shift = Temp("uint", $"52u - {safeMsb}");
+            var fraction = Temp(
+                "ulong",
+                $"(((ulong){magnitude} << {shift}) & 0x000FFFFFFFFFFFFFul)");
+            var exponent = Temp("ulong", $"(ulong)(1023u + {safeMsb})");
+            var signBits = signed
+                ? Temp("ulong", $"{negative} ? 0x8000000000000000ul : 0ul")
+                : "0ul";
+            var result = Temp(
+                "ulong",
+                $"{isZero} ? 0ul : ({signBits} | ({exponent} << 52u) | {fraction})");
+            StoreVector(destination, $"(uint){result}");
+            StoreVector(destination + 1, $"(uint)({result} >> 32u)");
+            return true;
+        }
+
+        private bool TryEmitFloat64FromF32(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            var destination = DestinationVector(instruction);
+            var bits = Temp("uint", $"as_type<uint>({F(instruction, 0)})");
+            var sign = Temp(
+                "ulong",
+                $"(ulong)({bits} >> 31u) << 63u");
+            var exponent = Temp("uint", $"({bits} >> 23u) & 0xFFu");
+            var fraction = Temp("uint", $"{bits} & 0x007FFFFFu");
+            var isZero = Temp("bool", $"{fraction} == 0u");
+            var msb = Temp("uint", $"(uint)(31 - int(clz({fraction})))");
+            var safeMsb = Temp("uint", $"{isZero} ? 0u : {msb}");
+            var subnormalFraction = Temp(
+                "ulong",
+                $"(((ulong){fraction} << (52u - {safeMsb})) & 0x000FFFFFFFFFFFFFul)");
+            var normalFraction = Temp(
+                "ulong",
+                $"(ulong){fraction} << 29u");
+            var normalExponent = Temp("ulong", $"(ulong)({exponent} + 896u)");
+            var subnormalExponent = Temp("ulong", $"(ulong)({safeMsb} + 874u)");
+            var normal = Temp(
+                "ulong",
+                $"{sign} | ({normalExponent} << 52u) | {normalFraction}");
+            var subnormal = Temp(
+                "ulong",
+                $"{sign} | ({subnormalExponent} << 52u) | {subnormalFraction}");
+            var finite = Temp(
+                "ulong",
+                $"{exponent} == 0u ? ({isZero} ? {sign} : {subnormal}) : {normal}");
+            var special = Temp(
+                "ulong",
+                $"{sign} | 0x7FF0000000000000ul | ((ulong){fraction} << 29u)");
+            var result = Temp(
+                "ulong",
+                $"{exponent} == 0xFFu ? {special} : {finite}");
+            StoreVector(destination, $"(uint){result}");
+            StoreVector(destination + 1, $"(uint)({result} >> 32u)");
+            return true;
+        }
+
+        private string EmitFloat32FromF64(Gen5ShaderInstruction instruction)
+        {
+            var bits = Temp("ulong", Float64SourceBits(instruction, 0));
+            var sign = Temp("uint", $"(uint)({bits} >> 32u) & 0x80000000u");
+            var magnitudeBits = Temp("ulong", $"{bits} & 0x7FFFFFFFFFFFFFFFul");
+            var exponent = Temp("uint", $"(uint)(({magnitudeBits} >> 52u) & 0x7FFul)");
+            var fraction = Temp("ulong", $"{magnitudeBits} & 0x000FFFFFFFFFFFFFul");
+            var significand = Temp("ulong", $"{fraction} | 0x0010000000000000ul");
+            var normalRetained = Temp("uint", $"(uint)({significand} >> 29u)");
+            var normalRemainder = Temp("ulong", $"{significand} & 0x1FFFFFFFul");
+            var normalRound = Temp(
+                "bool",
+                $"{normalRemainder} > 0x10000000ul || " +
+                $"({normalRemainder} == 0x10000000ul && ({normalRetained} & 1u) != 0u)");
+            var normalRounded = Temp("uint", $"{normalRetained} + ({normalRound} ? 1u : 0u)");
+            var normalCarry = Temp("bool", $"{normalRounded} >= 0x01000000u");
+            var normalExponent = Temp(
+                "uint",
+                $"({exponent} - 896u) + ({normalCarry} ? 1u : 0u)");
+            var normalFraction = Temp(
+                "uint",
+                $"(({normalCarry} ? ({normalRounded} >> 1u) : {normalRounded}) & 0x007FFFFFu)");
+            var normalBits = Temp(
+                "uint",
+                $"{exponent} >= 1151u ? ({sign} | 0x7F800000u) : " +
+                $"({sign} | (({normalExponent} & 0xFFu) << 23u) | {normalFraction})");
+
+            var subnormalShift = Temp("uint", $"min(926u - {exponent}, 63u)");
+            var subnormalRetained = Temp(
+                "uint",
+                $"(uint)({significand} >> {subnormalShift})");
+            var subnormalMask = Temp("ulong", $"(1ul << {subnormalShift}) - 1ul");
+            var subnormalRemainder = Temp("ulong", $"{significand} & {subnormalMask}");
+            var subnormalHalf = Temp("ulong", $"1ul << ({subnormalShift} - 1u)");
+            var subnormalRound = Temp(
+                "bool",
+                $"{subnormalRemainder} > {subnormalHalf} || " +
+                $"({subnormalRemainder} == {subnormalHalf} && ({subnormalRetained} & 1u) != 0u)");
+            var subnormalRounded = Temp(
+                "uint",
+                $"{subnormalRetained} + ({subnormalRound} ? 1u : 0u)");
+            var subnormalBits = Temp(
+                "uint",
+                $"{sign} | ({subnormalRounded} >= 0x00800000u ? 0x00800000u : {subnormalRounded})");
+            var finite = Temp(
+                "uint",
+                $"{exponent} == 0u ? {sign} : ({exponent} < 897u ? {subnormalBits} : {normalBits})");
+            var specialPayload = Temp("uint", $"(uint)({fraction} >> 29u) & 0x007FFFFFu");
+            var specialFraction = Temp(
+                "uint",
+                $"{fraction} == 0ul ? 0u : ({specialPayload} == 0u ? 1u : {specialPayload})");
+            var specialBits = Temp(
+                "uint",
+                $"{sign} | 0x7F800000u | {specialFraction}");
+            return Temp(
+                "uint",
+                $"{exponent} == 0x7FFu ? {specialBits} : {finite}");
+        }
+
+        private enum Float64RoundMode
+        {
+            Trunc,
+            Ceil,
+            NearestEven,
+            Floor,
+        }
+
+        private bool TryEmitFloat64Round(
+            Gen5ShaderInstruction instruction,
+            Float64RoundMode mode,
+            out string error)
+        {
+            error = string.Empty;
+            var destination = DestinationVector(instruction);
+            var bits = Temp("ulong", Float64SourceBits(instruction, 0));
+            var sign = Temp("ulong", $"({bits} & 0x8000000000000000ul)");
+            var magnitudeBits = Temp("ulong", $"({bits} & 0x7FFFFFFFFFFFFFFFul)");
+            var exponent = Temp("uint", $"(uint)(({magnitudeBits} >> 52u) & 0x7FFul)");
+            var fraction = Temp("ulong", $"({magnitudeBits} & 0x000FFFFFFFFFFFFFul)");
+            var significand = Temp("ulong", $"{fraction} | 0x0010000000000000ul");
+            var isSpecial = Temp("bool", $"{exponent} == 0x7FFu");
+            var isSubnormal = Temp("bool", $"{exponent} < 1023u");
+            var hasNormalFraction = Temp("bool", $"{exponent} < 1075u");
+            var normalShift = Temp("uint", $"1075u - {exponent}");
+            var normalMask = Temp(
+                "ulong",
+                $"(((1ul << {normalShift}) - 1ul) & 0x000FFFFFFFFFFFFFul)");
+            var truncMask = Temp(
+                "ulong",
+                $"{isSubnormal} ? 0x000FFFFFFFFFFFFFul : ({hasNormalFraction} ? {normalMask} : 0ul)");
+            var truncatedMagnitude = Temp(
+                "ulong",
+                $"{magnitudeBits} & ~{truncMask}");
+            var hasFraction = Temp(
+                "bool",
+                $"({magnitudeBits} & {truncMask}) != 0ul");
+            string increment;
+            switch (mode)
+            {
+                case Float64RoundMode.Trunc:
+                    increment = "false";
+                    break;
+                case Float64RoundMode.Ceil:
+                    increment = Temp("bool", $"({sign} == 0ul) && {hasFraction}");
+                    break;
+                case Float64RoundMode.Floor:
+                    increment = Temp("bool", $"({sign} != 0ul) && {hasFraction}");
+                    break;
+                default:
+                {
+                    var isAtLeastHalf = Temp("bool", $"{exponent} >= 1022u");
+                    var isRoundable = Temp("bool", $"{exponent} < 1075u");
+                    var halfShift = Temp("uint", $"1075u - {exponent}");
+                    var halfMask = Temp("ulong", $"(1ul << {halfShift}) - 1ul");
+                    var remainder = Temp("ulong", $"{significand} & {halfMask}");
+                    var half = Temp("ulong", $"1ul << ({halfShift} - 1u)");
+                    var greaterHalf = Temp("bool", $"{remainder} > {half}");
+                    var equalHalf = Temp("bool", $"{remainder} == {half}");
+                    var odd = Temp(
+                        "bool",
+                        $"({exponent} < 1075u) && ((({significand} >> {halfShift}) & 1ul) != 0ul)");
+                    increment = Temp(
+                        "bool",
+                        $"{isRoundable} && {isAtLeastHalf} && ({greaterHalf} || ({equalHalf} && {odd}))");
+                    break;
+                }
+            }
+
+            var unit = Temp(
+                "ulong",
+                $"{isSubnormal} ? 0x3FF0000000000000ul : ({hasNormalFraction} ? (1ul << {normalShift}) : 0ul)");
+            var roundedMagnitude = Temp(
+                "ulong",
+                $"{increment} ? ({truncatedMagnitude} + {unit}) : {truncatedMagnitude}");
+            var result = Temp(
+                "ulong",
+                $"{isSpecial} ? {bits} : ({sign} | {roundedMagnitude})");
+            StoreVector(destination, $"(uint){result}");
+            StoreVector(destination + 1, $"(uint)({result} >> 32u)");
+            return true;
+        }
+
+        private bool TryEmitFloat64Fract(
+            Gen5ShaderInstruction instruction,
+            out string error)
+        {
+            error = string.Empty;
+            var destination = DestinationVector(instruction);
+            var bits = Temp("ulong", Float64SourceBits(instruction, 0));
+            var sign = Temp("ulong", $"{bits} & 0x8000000000000000ul");
+            var magnitude = Temp("ulong", $"{bits} & 0x7FFFFFFFFFFFFFFFul");
+            var exponent = Temp("uint", $"(uint)(({magnitude} >> 52u) & 0x7FFul)");
+            var fraction = Temp("ulong", $"{magnitude} & 0x000FFFFFFFFFFFFFul");
+            var significand = Temp("ulong", $"{fraction} | 0x0010000000000000ul");
+            var belowOne = Temp("bool", $"{exponent} < 1023u");
+            var belowInteger = Temp("bool", $"{exponent} < 1075u");
+            var shift = Temp("uint", $"min(1075u - {exponent}, 63u)");
+            var remainderMask = Temp("ulong", $"(1ul << {shift}) - 1ul");
+            var remainder = Temp("ulong", $"{significand} & {remainderMask}");
+            var remainderLow = Temp("uint", $"(uint){remainder}");
+            var remainderHigh = Temp("uint", $"(uint)({remainder} >> 32u)");
+            var remainderHighMsb = Temp("int", $"31 - int(clz({remainderHigh}))");
+            var remainderLowMsb = Temp("int", $"31 - int(clz({remainderLow}))");
+            var remainderMsb = Temp(
+                "uint",
+                $"{remainder} == 0ul ? 0u : ({remainderHigh} != 0u ? (uint)({remainderHighMsb} + 32) : (uint){remainderLowMsb})");
+            var remainderFraction = Temp(
+                "ulong",
+                $"(({remainder} << (52u - {remainderMsb})) & 0x000FFFFFFFFFFFFFul)");
+            var remainderExponent = Temp(
+                "ulong",
+                $"(ulong)({exponent} - 52u + {remainderMsb})");
+            var normalizedRemainder = Temp(
+                "ulong",
+                $"({remainderExponent} << 52u) | {remainderFraction}");
+            var positiveFraction = Temp(
+                "ulong",
+                $"{belowOne} ? {magnitude} : ({belowInteger} ? {normalizedRemainder} : 0ul)");
+
+            var yExponent = Temp("uint", $"(uint)({positiveFraction} >> 52u) & 0x7FFu");
+            var yFraction = Temp("ulong", $"{positiveFraction} & 0x000FFFFFFFFFFFFFul");
+            var ySignificand = Temp("ulong", $"{yFraction} | 0x0010000000000000ul");
+            var ySmall = Temp("bool", $"{yExponent} < 970u");
+            var yShift = Temp("uint", $"min(1022u - {yExponent}, 63u)");
+            var yMask = Temp("ulong", $"(1ul << {yShift}) - 1ul");
+            var yRetained = Temp("ulong", $"{ySignificand} >> {yShift}");
+            var yRemainder = Temp("ulong", $"{ySignificand} & {yMask}");
+            var yHalf = Temp(
+                "ulong",
+                $"{yShift} == 0u ? 0ul : (1ul << ({yShift} - 1u))");
+            var yRound = Temp(
+                "bool",
+                $"{yRemainder} > {yHalf} || ({yRemainder} == {yHalf} && ({yRetained} & 1ul) != 0ul)");
+            var yUnits = Temp(
+                "ulong",
+                $"{ySmall} ? 0ul : ({yRetained} + ({yRound} ? 1ul : 0ul))");
+            var halfTie = Temp(
+                "bool",
+                $"{yExponent} == 970u && {yFraction} == 0ul");
+            var difference = Temp(
+                "ulong",
+                $"{halfTie} ? 0x0020000000000000ul : (0x0020000000000000ul - {yUnits})");
+            var differenceLow = Temp("uint", $"(uint){difference}");
+            var differenceHigh = Temp("uint", $"(uint)({difference} >> 32u)");
+            var differenceHighMsb = Temp("int", $"31 - int(clz({differenceHigh}))");
+            var differenceLowMsb = Temp("int", $"31 - int(clz({differenceLow}))");
+            var differenceMsb = Temp(
+                "uint",
+                $"{differenceHigh} != 0u ? (uint)({differenceHighMsb} + 32) : (uint){differenceLowMsb}");
+            var differenceSafeMsb = Temp(
+                "uint",
+                $"{difference} == 0x0020000000000000ul ? 52u : {differenceMsb}");
+            var oneMinus = Temp(
+                "ulong",
+                $"{difference} == 0x0020000000000000ul ? 0x3FF0000000000000ul : " +
+                $"(((ulong)(970u + {differenceSafeMsb}) << 52u) | " +
+                $"(({difference} << (52u - {differenceSafeMsb})) & 0x000FFFFFFFFFFFFFul))");
+            var negativeFraction = Temp(
+                "ulong",
+                $"{positiveFraction} != 0ul ? {oneMinus} : 0ul");
+            var finite = Temp(
+                "ulong",
+                $"{sign} != 0ul ? {negativeFraction} : {positiveFraction}");
+            var special = Temp(
+                "ulong",
+                $"{fraction} == 0ul ? ({sign} | 0x7FF8000000000000ul) : {bits}");
+            var result = Temp(
+                "ulong",
+                $"{exponent} == 0x7FFu ? {special} : {finite}");
+            StoreVector(destination, $"(uint){result}");
+            StoreVector(destination + 1, $"(uint)({result} >> 32u)");
+            return true;
+        }
+
+        private string EmitSatPkU8I16(Gen5ShaderInstruction instruction)
+        {
+            var source = Temp(
+                "uint",
+                RawSource(instruction, 0, applySdwaIntegerModifiers: false));
+            var low = Temp(
+                "uint",
+                $"(uint)clamp(int(as_type<short>((ushort)({source} & 0xFFFFu))), 0, 255)");
+            var high = Temp(
+                "uint",
+                $"(uint)clamp(int(as_type<short>((ushort)({source} >> 16u))), 0, 255)");
+            return $"(({low} & 0xFFu) | (({high} & 0xFFu) << 8u))";
+        }
+
+        private string EmitFfbh(Gen5ShaderInstruction instruction, bool signed)
+        {
+            var source = Temp("uint", RawSource(instruction, 0));
+            var search = signed
+                ? Temp("uint", $"((({source} & 0x80000000u) != 0u) ? ~{source} : {source})")
+                : source;
+            return $"({search} == 0u ? 0xFFFFFFFFu : (uint)clz({search}))";
+        }
+
+        private string EmitScalarF16SourceBits(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex)
+        {
+            string raw;
+            if (instruction.Sources[sourceIndex] is
+                { Kind: Gen5OperandKind.EncodedConstant, Value: >= 240 and <= 248 } constant &&
+                Gen5InlineConstants.TryDecode(constant.Value, out var floatBits))
+            {
+                raw = $"0x{BitConverter.HalfToUInt16Bits((Half)BitConverter.UInt32BitsToSingle(floatBits)):X4}u";
+            }
+            else
+            {
+                raw = RawSource(instruction, sourceIndex, applySdwaIntegerModifiers: false);
+            }
+
+            if (instruction.Control is Gen5Vop3Control control &&
+                (control.OperandSelect & (1u << sourceIndex)) != 0)
+            {
+                raw = $"(({raw}) >> 16)";
+            }
+
+            return $"(({raw}) & 0xFFFFu)";
+        }
+
+        private string EmitScalarF16Operand(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex)
+        {
+            return Temp(
+                "half",
+                $"as_type<half>((ushort)({EmitScalarF16OperandBits(instruction, sourceIndex)}))");
+        }
+
+        private string EmitScalarF16OperandBits(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex)
+        {
+            string value = EmitScalarF16SourceBits(instruction, sourceIndex);
+            var (absoluteMask, negateMask) = instruction.Control switch
+            {
+                Gen5Vop3Control control => (control.AbsoluteMask, control.NegateMask),
+                Gen5SdwaControl control => (control.AbsoluteMask, control.NegateMask),
+                Gen5DppControl control => (control.AbsoluteMask, control.NegateMask),
+                _ => (0u, 0u),
+            };
+            if ((absoluteMask & (1u << sourceIndex)) != 0)
+            {
+                value = $"(({value}) & 0x7FFFu)";
+            }
+
+            if ((negateMask & (1u << sourceIndex)) != 0)
+            {
+                value = $"(({value}) ^ 0x8000u)";
+            }
+
+            return Temp("uint", value);
+        }
+
+        private string EmitScalarF16Destination(
+            Gen5ShaderInstruction instruction,
+            uint destination)
+        {
+            var bits = instruction.Control is Gen5Vop3Control { OperandSelect: var operandSelect } &&
+                       (operandSelect & 8) != 0
+                ? $"((v[{destination}] >> 16) & 0xFFFFu)"
+                : $"(v[{destination}] & 0xFFFFu)";
+            return $"as_type<half>((ushort)({bits}))";
+        }
+
+        private string EmitPackedF16Accumulate(
+            Gen5ShaderInstruction instruction,
+            uint destination)
+        {
+            var source0 = Temp("uint", RawSource(instruction, 0));
+            var source1 = Temp("uint", RawSource(instruction, 1));
+            string Lane(string source, bool high) =>
+                $"as_type<half>((ushort)(({source} >> {(high ? 16 : 0)}) & 0xFFFFu))";
+            var low = Temp(
+                "half",
+                $"fma({Lane(source0, false)}, {Lane(source1, false)}, " +
+                $"as_type<half>((ushort)(v[{destination}] & 0xFFFFu)))");
+            var high = Temp(
+                "half",
+                $"fma({Lane(source0, true)}, {Lane(source1, true)}, " +
+                $"as_type<half>((ushort)(v[{destination}] >> 16)))");
+            return $"((uint)as_type<ushort>({low}) | ((uint)as_type<ushort>({high}) << 16))";
+        }
+
+        /// <summary>
+        /// Emits the scalar f16/i16/u16 VOP3 family. OPSEL[0:2] chooses a source
+        /// half and OPSEL[3] chooses the destination half, preserving its sibling.
+        /// </summary>
+        private string EmitVop3Half(Gen5ShaderInstruction instruction, uint destination)
+        {
+            if (instruction.Control is not Gen5Vop3Control control)
+            {
+                throw new NotSupportedException($"missing VOP3 control for {instruction.Opcode}");
+            }
+
+            string halfBits;
+            if (instruction.Opcode.EndsWith("F16", StringComparison.Ordinal))
+            {
+                var source0 = EmitVop3F16Operand(instruction, control, 0);
+                var source1 = EmitVop3F16Operand(instruction, control, 1);
+                var source2 = EmitVop3F16Operand(instruction, control, 2);
+                string value = instruction.Opcode switch
+                {
+                    "VFmaF16" => $"fma({source0}, {source1}, {source2})",
+                    "VMin3F16" => $"fmin(fmin({source0}, {source1}), {source2})",
+                    "VMax3F16" => $"fmax(fmax({source0}, {source1}), {source2})",
+                    "VMed3F16" => EmitVop3F16Median(source0, source1, source2),
+                    _ => source0,
+                };
+                value = control.OutputModifier switch
+                {
+                    1 => $"(({value}) * half(2.0f))",
+                    2 => $"(({value}) * half(4.0f))",
+                    3 => $"(({value}) * half(0.5f))",
+                    _ => value,
+                };
+                if (control.Clamp)
+                {
+                    value = $"clamp({value}, half(0.0f), half(1.0f))";
+                }
+
+                halfBits = $"(uint)as_type<ushort>(half({value}))";
+            }
+            else
+            {
+                var signed = instruction.Opcode.EndsWith("I16", StringComparison.Ordinal);
+                var source0 = EmitVop3Integer16Operand(instruction, control, 0, signed);
+                var source1 = EmitVop3Integer16Operand(instruction, control, 1, signed);
+                var source2 = EmitVop3Integer16Operand(instruction, control, 2, signed);
+                var min = instruction.Opcode.StartsWith("VMin3", StringComparison.Ordinal);
+                var max = instruction.Opcode.StartsWith("VMax3", StringComparison.Ordinal);
+                string value;
+                if (min)
+                {
+                    value = $"min(min({source0}, {source1}), {source2})";
+                }
+                else if (max)
+                {
+                    value = $"max(max({source0}, {source1}), {source2})";
+                }
+                else
+                {
+                    var max01 = Temp(signed ? "short" : "ushort", $"max({source0}, {source1})");
+                    var max3 = Temp(signed ? "short" : "ushort", $"max({max01}, {source2})");
+                    value = $"({max3} == {source0} ? max({source1}, {source2}) : " +
+                        $"({max3} == {source1} ? max({source0}, {source2}) : {max01}))";
+                }
+
+                halfBits = signed
+                    ? $"(uint)as_type<ushort>(short({value}))"
+                    : $"(uint)ushort({value})";
+            }
+
+            var packed = Temp("uint", $"({halfBits}) & 0xFFFFu");
+            return (control.OperandSelect & 8) == 0
+                ? $"((v[{destination}] & 0xFFFF0000u) | {packed})"
+                : $"((v[{destination}] & 0x0000FFFFu) | ({packed} << 16))";
+        }
+
+        private string EmitVop3HalfBits(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3Control control,
+            int sourceIndex)
+        {
+            string raw;
+            if (instruction.Sources[sourceIndex] is
+                { Kind: Gen5OperandKind.EncodedConstant, Value: >= 240 and <= 248 } constant &&
+                Gen5InlineConstants.TryDecode(constant.Value, out var floatBits))
+            {
+                var half = (Half)BitConverter.UInt32BitsToSingle(floatBits);
+                raw = $"0x{BitConverter.HalfToUInt16Bits(half):X4}u";
+            }
+            else
+            {
+                raw = RawSource(instruction, sourceIndex);
+            }
+
+            return (control.OperandSelect & (1u << sourceIndex)) == 0
+                ? $"(({raw}) & 0xFFFFu)"
+                : $"((({raw}) >> 16) & 0xFFFFu)";
+        }
+
+        private string EmitVop3F16Operand(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3Control control,
+            int sourceIndex)
+        {
+            string value = $"as_type<half>((ushort)({EmitVop3HalfBits(instruction, control, sourceIndex)}))";
+            if ((control.AbsoluteMask & (1u << sourceIndex)) != 0)
+            {
+                value = $"abs({value})";
+            }
+
+            if ((control.NegateMask & (1u << sourceIndex)) != 0)
+            {
+                value = $"(-{value})";
+            }
+
+            return Temp("half", value);
+        }
+
+        private string EmitVop3F16Median(string source0, string source1, string source2)
+        {
+            var min3 = Temp("half", $"fmin(fmin({source0}, {source1}), {source2})");
+            var max01 = Temp("half", $"fmax({source0}, {source1})");
+            var max3 = Temp("half", $"fmax({max01}, {source2})");
+            var median = $"({max3} == {source0} ? fmax({source1}, {source2}) : " +
+                $"({max3} == {source1} ? fmax({source0}, {source2}) : {max01}))";
+            return $"(isnan({source0}) || isnan({source1}) || isnan({source2}) ? {min3} : {median})";
+        }
+
+        private string EmitVop3Integer16Operand(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3Control control,
+            int sourceIndex,
+            bool signed)
+        {
+            var bits = EmitVop3HalfBits(instruction, control, sourceIndex);
+            return Temp(signed ? "short" : "ushort", $"({(signed ? "short" : "ushort")})({bits})");
+        }
+
+        private string EmitVop3Integer16(
+            Gen5ShaderInstruction instruction,
+            uint destination)
+        {
+            if (instruction.Control is not Gen5Vop3Control control)
+            {
+                throw new NotSupportedException($"missing VOP3 control for {instruction.Opcode}");
+            }
+
+            var leftBits = EmitVop3HalfBits(instruction, control, 0);
+            var rightBits = EmitVop3HalfBits(instruction, control, 1);
+            var leftUnsigned = Temp("uint", leftBits);
+            var rightUnsigned = Temp("uint", rightBits);
+            var leftSigned = Temp("int", $"(int)(short)({leftBits})");
+            var rightSigned = Temp("int", $"(int)(short)({rightBits})");
+            string value = instruction.Opcode switch
+            {
+                "VAddNcU16" => control.Clamp
+                    ? $"min({leftUnsigned} + {rightUnsigned}, 65535u)"
+                    : $"{leftUnsigned} + {rightUnsigned}",
+                "VSubNcU16" => control.Clamp
+                    ? $"({leftUnsigned} < {rightUnsigned} ? 0u : {leftUnsigned} - {rightUnsigned})"
+                    : $"{leftUnsigned} - {rightUnsigned}",
+                "VMulLoU16" => control.Clamp
+                    ? $"min({leftUnsigned} * {rightUnsigned}, 65535u)"
+                    : $"{leftUnsigned} * {rightUnsigned}",
+                "VLshrrevB16" => $"{rightUnsigned} >> ({leftUnsigned} & 15u)",
+                "VLshlrevB16" => $"{rightUnsigned} << ({leftUnsigned} & 15u)",
+                "VAshrrevI16" => $"(uint)({rightSigned} >> ({leftUnsigned} & 15u))",
+                "VMaxU16" => $"max({leftUnsigned}, {rightUnsigned})",
+                "VMinU16" => $"min({leftUnsigned}, {rightUnsigned})",
+                "VMaxI16" => $"(uint)max({leftSigned}, {rightSigned})",
+                "VMinI16" => $"(uint)min({leftSigned}, {rightSigned})",
+                "VAddNcI16" => control.Clamp
+                    ? $"(uint)clamp({leftSigned} + {rightSigned}, -32768, 32767)"
+                    : $"(uint)({leftSigned} + {rightSigned})",
+                "VSubNcI16" => control.Clamp
+                    ? $"(uint)clamp({leftSigned} - {rightSigned}, -32768, 32767)"
+                    : $"(uint)({leftSigned} - {rightSigned})",
+                "VMadU16" => control.Clamp
+                    ? $"min({leftUnsigned} * {rightUnsigned} + " +
+                      $"(uint)({EmitVop3HalfBits(instruction, control, 2)}), 65535u)"
+                    : $"{leftUnsigned} * {rightUnsigned} + " +
+                      $"(uint)({EmitVop3HalfBits(instruction, control, 2)})",
+                "VMadI16" => control.Clamp
+                    ? $"(uint)clamp({leftSigned} * {rightSigned} + " +
+                      $"(int)(short)({EmitVop3HalfBits(instruction, control, 2)}), -32768, 32767)"
+                    : $"(uint)({leftSigned} * {rightSigned} + " +
+                      $"(int)(short)({EmitVop3HalfBits(instruction, control, 2)}))",
+                _ => throw new NotSupportedException($"unsupported VOP3 i16 operation {instruction.Opcode}"),
+            };
+
+            var packed = Temp("uint", $"({value}) & 0xFFFFu");
+            return (control.OperandSelect & 8) == 0
+                ? $"((v[{destination}] & 0xFFFF0000u) | {packed})"
+                : $"((v[{destination}] & 0x0000FFFFu) | ({packed} << 16))";
+        }
+
+        private string EmitSigned24Product(
+            Gen5ShaderInstruction instruction,
+            bool high)
+        {
+            var left = Temp(
+                "int",
+                $"(as_type<int>(({RawSource(instruction, 0)}) << 8u) >> 8)");
+            var right = Temp(
+                "int",
+                $"(as_type<int>(({RawSource(instruction, 1)}) << 8u) >> 8)");
+            var product = Temp("long", $"long({left}) * long({right})");
+            return high
+                ? $"(uint)({product} >> 32)"
+                : $"(uint){product}";
+        }
+
+        private string EmitSigned24Mad(Gen5ShaderInstruction instruction)
+        {
+            var left = Temp(
+                "int",
+                $"(as_type<int>(({RawSource(instruction, 0)}) << 8u) >> 8)");
+            var right = Temp(
+                "int",
+                $"(as_type<int>(({RawSource(instruction, 1)}) << 8u) >> 8)");
+            var product = Temp("long", $"long({left}) * long({right})");
+            return $"(uint)({product} + long(as_type<int>({RawSource(instruction, 2)})))";
+        }
+
+        private string EmitLerpU8(Gen5ShaderInstruction instruction)
+        {
+            var first = RawSource(instruction, 0);
+            var second = RawSource(instruction, 1);
+            var rounding = RawSource(instruction, 2);
+            string ByteAverage(uint shift) =>
+                $"(((({first} >> {shift}u) & 0xFFu) + " +
+                $"(({second} >> {shift}u) & 0xFFu) + " +
+                $"(({rounding} >> {shift}u) & 1u)) >> 1u) << {shift}u)";
+
+            return $"({ByteAverage(0)} | {ByteAverage(8)} | " +
+                $"{ByteAverage(16)} | {ByteAverage(24)})";
+        }
+
+        private string EmitMixedWidthMad16(Gen5ShaderInstruction instruction)
+        {
+            if (instruction.Control is not Gen5Vop3Control control)
+            {
+                throw new NotSupportedException($"missing VOP3 control for {instruction.Opcode}");
+            }
+
+            var left = EmitVop3HalfBits(instruction, control, 0);
+            var right = EmitVop3HalfBits(instruction, control, 1);
+            var addend = RawSource(instruction, 2);
+            return instruction.Opcode == "VMadI32I16"
+                ? $"(uint)((int)(short)({left}) * (int)(short)({right}) + as_type<int>({addend}))"
+                : $"((uint)({left}) * (uint)({right}) + ({addend}))";
+        }
+
+        private string EmitDivFixupF16(
+            Gen5ShaderInstruction instruction,
+            uint destination)
+        {
+            if (instruction.Control is not Gen5Vop3Control control)
+            {
+                throw new NotSupportedException("missing VOP3 control for VDivFixupF16");
+            }
+
+            string SourceBits(int index)
+            {
+                var bits = EmitVop3HalfBits(instruction, control, index);
+                if ((control.AbsoluteMask & (1u << index)) != 0)
+                {
+                    bits = $"(({bits}) & 0x7FFFu)";
+                }
+
+                if ((control.NegateMask & (1u << index)) != 0)
+                {
+                    bits = $"(({bits}) ^ 0x8000u)";
+                }
+
+                return Temp("uint", bits);
+            }
+
+            var quotient = SourceBits(0);
+            var denominator = SourceBits(1);
+            var numerator = SourceBits(2);
+            var denominatorAbs = Temp("uint", $"{denominator} & 0x7FFFu");
+            var numeratorAbs = Temp("uint", $"{numerator} & 0x7FFFu");
+            var sign = Temp("uint", $"({denominator} ^ {numerator}) & 0x8000u");
+            var denominatorNan = Temp(
+                "bool",
+                $"(({denominator} & 0x7C00u) == 0x7C00u) && (({denominator} & 0x03FFu) != 0u)");
+            var numeratorNan = Temp(
+                "bool",
+                $"(({numerator} & 0x7C00u) == 0x7C00u) && (({numerator} & 0x03FFu) != 0u)");
+            var invalid = Temp(
+                "bool",
+                $"(({denominatorAbs} == 0u) && ({numeratorAbs} == 0u)) || " +
+                $"(({denominatorAbs} == 0x7C00u) && ({numeratorAbs} == 0x7C00u))");
+            var infinityResult = Temp(
+                "bool",
+                $"({denominatorAbs} == 0u) || ({numeratorAbs} == 0x7C00u)");
+            var zeroResult = Temp(
+                "bool",
+                $"({denominatorAbs} == 0x7C00u) || ({numeratorAbs} == 0u)");
+            var fixedBits = Temp(
+                "uint",
+                $"{numeratorNan} ? ({numerator} | 0x0200u) : " +
+                $"({denominatorNan} ? ({denominator} | 0x0200u) : " +
+                $"({invalid} ? 0xFE00u : " +
+                $"({infinityResult} ? ({sign} | 0x7C00u) : " +
+                $"({zeroResult} ? {sign} : ({sign} | ({quotient} & 0x7FFFu))))))");
+            return (control.OperandSelect & 8) == 0
+                ? $"((v[{destination}] & 0xFFFF0000u) | {fixedBits})"
+                : $"((v[{destination}] & 0x0000FFFFu) | ({fixedBits} << 16))";
+        }
+
+        private string EmitDivFmasF32(Gen5ShaderInstruction instruction)
+        {
+            var fused = Temp(
+                "float",
+                $"fma({F(instruction, 0)}, {F(instruction, 1)}, {F(instruction, 2)})");
+            return FloatResult(
+                instruction,
+                $"vcc ? (({fused}) * 4294967296.0f) : ({fused})");
+        }
+
+        private string EmitLegacyFloatMultiply(Gen5ShaderInstruction instruction)
+        {
+            var left = F(instruction, 0);
+            var right = F(instruction, 1);
+            var product = Temp("float", $"({left}) * ({right})");
+            var zeroProduct = LegacyFloatZeroProduct(left, right);
+            return FloatResult(instruction, $"{zeroProduct} ? 0.0f : ({product})");
+        }
+
+        private string EmitMullitF32(Gen5ShaderInstruction instruction)
+        {
+            var left = F(instruction, 0);
+            var right = F(instruction, 1);
+            var product = Temp("float", $"({left}) * ({right})");
+            var zeroProduct = LegacyFloatZeroProduct(left, right);
+            // V_MULLIT_F32 documents 0.0*x = 0.0. Other special values use
+            // the target's normal floating-point multiply behavior.
+            return FloatResult(instruction, $"{zeroProduct} ? 0.0f : ({product})");
+        }
+
+        private string EmitLegacyFloatMultiplyAccumulate(
+            Gen5ShaderInstruction instruction,
+            uint destination)
+        {
+            var left = F(instruction, 0);
+            var right = F(instruction, 1);
+            var product = Temp("float", $"({left}) * ({right})");
+            var zeroProduct = LegacyFloatZeroProduct(left, right);
+            var productOrZero = $"({zeroProduct} ? 0.0f : ({product}))";
+            return FloatResult(
+                instruction,
+                $"({productOrZero} + as_type<float>(v[{destination}]))");
+        }
+
+        private string EmitLegacyFloatMad(Gen5ShaderInstruction instruction)
+        {
+            var left = F(instruction, 0);
+            var right = F(instruction, 1);
+            var addend = F(instruction, 2);
+            var product = Temp("float", $"({left}) * ({right})");
+            var zeroProduct = LegacyFloatZeroProduct(left, right);
+            return FloatResult(
+                instruction,
+                $"(({zeroProduct} ? 0.0f : ({product})) + ({addend}))");
+        }
+
+        private string LegacyFloatZeroProduct(string left, string right) => Temp(
+            "bool",
+            $"((as_type<uint>({left}) & 0x7FFFFFFFu) == 0u) || " +
+            $"((as_type<uint>({right}) & 0x7FFFFFFFu) == 0u)");
+
+        private string EmitVop3HalfPack(Gen5ShaderInstruction instruction)
+        {
+            if (instruction.Control is not Gen5Vop3Control control)
+            {
+                throw new NotSupportedException($"missing VOP3 control for {instruction.Opcode}");
+            }
+
+            if (instruction.Opcode == "VPackB32F16")
+            {
+                return $"(({EmitVop3HalfBits(instruction, control, 0)}) | " +
+                    $"(({EmitVop3HalfBits(instruction, control, 1)}) << 16))";
+            }
+
+            var left = EmitVop3F16Operand(instruction, control, 0);
+            var right = EmitVop3F16Operand(instruction, control, 1);
+            return instruction.Opcode == "VCvtPknormI16F16"
+                ? $"pack_float_to_snorm2x16(float2((float){left}, (float){right}))"
+                : $"pack_float_to_unorm2x16(float2((float){left}, (float){right}))";
+        }
+
+        private string EmitPackedF16(Gen5ShaderInstruction instruction)
+        {
+            if (instruction.Control is not Gen5Vop3pControl control)
+            {
+                throw new NotSupportedException($"missing VOP3P control for {instruction.Opcode}");
+            }
+
+            var low = EmitPackedF16Lane(instruction, control, highLane: false);
+            var high = EmitPackedF16Lane(instruction, control, highLane: true);
+            return $"((uint)as_type<ushort>({low}) | ((uint)as_type<ushort>({high}) << 16))";
+        }
+
+        private string EmitPackedInteger16(Gen5ShaderInstruction instruction)
+        {
+            if (instruction.Control is not Gen5Vop3pControl control)
+            {
+                throw new NotSupportedException($"missing VOP3P control for {instruction.Opcode}");
+            }
+
+            string EmitLane(bool highLane)
+            {
+                string SourceBits(int sourceIndex)
+                {
+                    var raw = RawSource(instruction, sourceIndex);
+                    var selectMask = highLane ? control.OpSelHiMask : control.OpSelMask;
+                    string bits = ((selectMask >> sourceIndex) & 1) == 0
+                        ? $"(({raw}) & 0xFFFFu)"
+                        : $"((({raw}) >> 16) & 0xFFFFu)";
+                    var negateMask = highLane ? control.NegHiMask : control.NegLoMask;
+                    if (((negateMask >> sourceIndex) & 1) != 0)
+                    {
+                        bits = $"((0u - ({bits})) & 0xFFFFu)";
+                    }
+
+                    return Temp("uint", bits);
+                }
+
+                var source0 = SourceBits(0);
+                var source1 = SourceBits(1);
+                var source2 = SourceBits(2);
+                var signed0 = $"(int)(short)({source0})";
+                var signed1 = $"(int)(short)({source1})";
+                var signed2 = $"(int)(short)({source2})";
+                string value = instruction.Opcode switch
+                {
+                    "VPkMadI16" => $"({signed0} * {signed1} + {signed2})",
+                    "VPkAddI16" => $"({signed0} + {signed1})",
+                    "VPkSubI16" => $"({signed0} - {signed1})",
+                    "VPkAshrrevI16" => $"({signed1} >> ({source0} & 15u))",
+                    "VPkMaxI16" => $"max({signed0}, {signed1})",
+                    "VPkMinI16" => $"min({signed0}, {signed1})",
+                    "VPkMulLoU16" => $"({source0} * {source1})",
+                    "VPkLshlrevB16" => $"({source1} << ({source0} & 15u))",
+                    "VPkLshrrevB16" => $"({source1} >> ({source0} & 15u))",
+                    "VPkMadU16" => $"({source0} * {source1} + {source2})",
+                    "VPkAddU16" => $"({source0} + {source1})",
+                    "VPkSubU16" when control.Clamp =>
+                        $"({source0} < {source1} ? 0u : {source0} - {source1})",
+                    "VPkSubU16" => $"({source0} - {source1})",
+                    "VPkMaxU16" => $"max({source0}, {source1})",
+                    "VPkMinU16" => $"min({source0}, {source1})",
+                    _ => throw new NotSupportedException(
+                        $"unsupported packed integer operation {instruction.Opcode}"),
+                };
+
+                var signed = instruction.Opcode is
+                    "VPkMadI16" or "VPkAddI16" or "VPkSubI16" or
+                    "VPkAshrrevI16" or "VPkMaxI16" or "VPkMinI16";
+                var saturatingArithmetic = instruction.Opcode is
+                    "VPkMadI16" or "VPkAddI16" or "VPkSubI16" or
+                    "VPkMulLoU16" or "VPkMadU16" or "VPkAddU16";
+                if (control.Clamp && saturatingArithmetic)
+                {
+                    value = signed
+                        ? $"clamp({value}, -32768, 32767)"
+                        : $"min((uint)({value}), 65535u)";
+                }
+
+                return $"((uint)({value}) & 0xFFFFu)";
+            }
+
+            var low = EmitLane(highLane: false);
+            var high = EmitLane(highLane: true);
+            return $"(({low}) | (({high}) << 16))";
+        }
+
+        private string EmitPackedIntegerDot(Gen5ShaderInstruction instruction)
+        {
+            if (instruction.Control is not Gen5Vop3pControl control)
+            {
+                throw new NotSupportedException($"missing VOP3P control for {instruction.Opcode}");
+            }
+
+            var signed = instruction.Opcode.Contains("I32I", StringComparison.Ordinal);
+            var componentBits = instruction.Opcode.StartsWith("VDot2", StringComparison.Ordinal)
+                ? 16
+                : instruction.Opcode.StartsWith("VDot4", StringComparison.Ordinal) ? 8 : 4;
+            var componentCount = 32 / componentBits;
+            var componentMask = (1u << componentBits) - 1;
+            var source0 = RawSource(instruction, 0);
+            var source1 = RawSource(instruction, 1);
+            var source2 = RawSource(instruction, 2);
+
+            string Component(string source, int index)
+            {
+                var bits = $"((({source}) >> {index * componentBits}) & 0x{componentMask:X}u)";
+                if (!signed)
+                {
+                    return bits;
+                }
+
+                return componentBits switch
+                {
+                    16 => $"(int)(short)({bits})",
+                    8 => $"(int)(char)({bits})",
+                    _ => $"(((int)({bits} << 28)) >> 28)",
+                };
+            }
+
+            var terms = new List<string>(componentCount + 1)
+            {
+                signed ? $"(long)as_type<int>({source2})" : $"(ulong)({source2})",
+            };
+            for (var index = 0; index < componentCount; index++)
+            {
+                terms.Add(
+                    $"({(signed ? "long" : "ulong")})({Component(source0, index)}) * " +
+                    $"({(signed ? "long" : "ulong")})({Component(source1, index)})");
+            }
+
+            var total = Temp(signed ? "long" : "ulong", string.Join(" + ", terms));
+            if (control.Clamp)
+            {
+                total = signed
+                    ? Temp("long", $"clamp({total}, (long)-2147483648, (long)2147483647)")
+                    : Temp("ulong", $"min({total}, 0xFFFFFFFFul)");
+            }
+
+            return $"(uint)({total})";
+        }
+
+        private string EmitPackedFloatDot(Gen5ShaderInstruction instruction)
+        {
+            if (instruction.Control is not Gen5Vop3pControl control)
+            {
+                throw new NotSupportedException($"missing VOP3P control for {instruction.Opcode}");
+            }
+
+            var source2Bits = FlushFloat32DenormalBits(
+                Temp("uint", RawSource(instruction, 2)));
+            string source2 = $"as_type<float>({source2Bits})";
+            if ((control.NegHiMask & 4) != 0)
+            {
+                source2 = $"fabs({source2})";
+            }
+
+            if ((control.NegLoMask & 4) != 0)
+            {
+                source2 = $"(-{source2})";
+            }
+
+            source2 = Temp("float", source2);
+            var low = Temp(
+                "float",
+                $"fma(float({EmitPackedF16Operand(instruction, control, 0, highLane: false)}), " +
+                $"float({EmitPackedF16Operand(instruction, control, 1, highLane: false)}), {source2})");
+            var dot = Temp(
+                "float",
+                $"fma(float({EmitPackedF16Operand(instruction, control, 0, highLane: true)}), " +
+                $"float({EmitPackedF16Operand(instruction, control, 1, highLane: true)}), {low})");
+            var resultBits = FlushFloat32DenormalBits(Temp("uint", AsUInt(dot)));
+            if (!control.Clamp)
+            {
+                return resultBits;
+            }
+
+            // Ordered comparisons intentionally map NaN and negative values to
+            // zero, matching the VOP3P clamp rule used by the SPIR-V backend.
+            var value = Temp("float", $"as_type<float>({resultBits})");
+            var clamped = Temp(
+                "float",
+                $"({value} > 0.0f ? ({value} < 1.0f ? {value} : 1.0f) : 0.0f)");
+            return AsUInt(clamped);
+        }
+
+        private string FlushFloat32DenormalBits(string bits) =>
+            Temp(
+                "uint",
+                $"((({bits} & 0x7F800000u) == 0u && ({bits} & 0x007FFFFFu) != 0u) " +
+                $"? ({bits} & 0x80000000u) : {bits})");
+
+        private string EmitPackedF16Lane(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            bool highLane)
+        {
+            var left = EmitPackedF16Operand(instruction, control, 0, highLane);
+            var right = EmitPackedF16Operand(instruction, control, 1, highLane);
+            string value = instruction.Opcode switch
+            {
+                "VPkAddF16" => $"({left} + {right})",
+                "VPkMulF16" => $"({left} * {right})",
+                "VPkMinF16" => $"fmin({left}, {right})",
+                "VPkMaxF16" => $"fmax({left}, {right})",
+                "VPkFmaF16" =>
+                    $"fma({left}, {right}, {EmitPackedF16Operand(instruction, control, 2, highLane)})",
+                _ => left,
+            };
+            if (control.Clamp)
+            {
+                value = $"clamp({value}, half(0.0f), half(1.0f))";
+            }
+
+            return Temp("half", value);
+        }
+
+        private string EmitPackedF16Operand(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            int sourceIndex,
+            bool highLane)
+        {
+            var raw = RawSource(instruction, sourceIndex);
+            var selectMask = highLane ? control.OpSelHiMask : control.OpSelMask;
+            var bits = ((selectMask >> sourceIndex) & 1) == 0
+                ? $"(({raw}) & 0xFFFFu)"
+                : $"((({raw}) >> 16) & 0xFFFFu)";
+            string value = $"as_type<half>((ushort)({bits}))";
+            var negateMask = highLane ? control.NegHiMask : control.NegLoMask;
+            if (((negateMask >> sourceIndex) & 1) != 0)
+            {
+                value = $"(-{value})";
+            }
+
+            return Temp("half", value);
+        }
+
+        private string EmitFmaMix(Gen5ShaderInstruction instruction, uint destination)
+        {
+            if (instruction.Control is not Gen5Vop3pControl control)
+            {
+                throw new NotSupportedException($"missing VOP3P control for {instruction.Opcode}");
+            }
+
+            var value =
+                $"fma({EmitFmaMixOperand(instruction, control, 0)}, " +
+                $"{EmitFmaMixOperand(instruction, control, 1)}, " +
+                $"{EmitFmaMixOperand(instruction, control, 2)})";
+            if (control.Clamp)
+            {
+                value = $"clamp({value}, 0.0f, 1.0f)";
+            }
+
+            var product = Temp("float", value);
+            if (instruction.Opcode == "VFmaMixF32")
+            {
+                return AsUInt(product);
+            }
+
+            var halfBits = Temp("uint", $"(uint)as_type<ushort>(half({product}))");
+            return instruction.Opcode == "VFmaMixloF16"
+                ? $"((v[{destination}] & 0xFFFF0000u) | {halfBits})"
+                : $"((v[{destination}] & 0x0000FFFFu) | ({halfBits} << 16))";
+        }
+
+        private string EmitFmaMixOperand(
+            Gen5ShaderInstruction instruction,
+            Gen5Vop3pControl control,
+            int sourceIndex)
+        {
+            var source = instruction.Sources[sourceIndex];
+            string value;
+            if (((control.OpSelHiMask >> sourceIndex) & 1) != 0 &&
+                source.Kind is Gen5OperandKind.VectorRegister or Gen5OperandKind.ScalarRegister)
+            {
+                var raw = RawSource(instruction, sourceIndex);
+                var bits = ((control.OpSelMask >> sourceIndex) & 1) == 0
+                    ? $"(({raw}) & 0xFFFFu)"
+                    : $"((({raw}) >> 16) & 0xFFFFu)";
+                value = $"float(as_type<half>((ushort)({bits})))";
+            }
+            else
+            {
+                value = AsFloat(RawSource(instruction, sourceIndex));
+            }
+
+            if (((control.NegHiMask >> sourceIndex) & 1) != 0)
+            {
+                value = $"fabs({value})";
+            }
+
+            if (((control.NegLoMask >> sourceIndex) & 1) != 0)
+            {
+                value = $"(-{value})";
+            }
+
+            return Temp("float", value);
         }
 
         // ---- DPP / SDWA machinery ----
@@ -523,7 +2347,10 @@ public static partial class Gen5MslTranslator
         {
             var (_, inRange) = EmitDppSourceLane(control);
             var rowEnabled = $"(({control.RowMask}u >> (sharpemu_lane >> 4)) & 1u) != 0u";
-            var bankEnabled = $"(({control.BankMask}u >> (sharpemu_lane & 3u)) & 1u) != 0u";
+            // RDNA2 BANK_MASK partitions each 16-lane row into four contiguous
+            // four-lane banks: [0:3], [4:7], [8:11], [12:15]. It does not select
+            // the lane's position within each bank.
+            var bankEnabled = $"(({control.BankMask}u >> ((sharpemu_lane >> 2u) & 3u)) & 1u) != 0u";
             var sourceAllows = control.BoundControl ? "true" : inRange;
             return Temp("bool", $"({rowEnabled}) && ({bankEnabled}) && ({sourceAllows})");
         }
@@ -574,27 +2401,96 @@ public static partial class Gen5MslTranslator
             error = string.Empty;
             var opcode = instruction.Opcode;
             string condition;
-            if (opcode is "VCmpClassF32" or "VCmpxClassF32")
+            if (opcode.EndsWith("F64", StringComparison.Ordinal))
+            {
+                condition = EmitFloat64Compare(instruction);
+            }
+            else if (opcode is
+                "VCmpClassF32" or "VCmpxClassF32" or
+                "VCmpClassF16" or "VCmpxClassF16")
             {
                 condition = EmitCompareClass(instruction);
             }
-            else if (opcode is "VCmpTruF32" or "VCmpxTruF32" or "VCmpTI32" or "VCmpTU32")
+            else if (opcode is
+                     "VCmpTruF32" or "VCmpxTruF32" or
+                     "VCmpTruF16" or "VCmpxTruF16" or
+                     "VCmpTI32" or "VCmpxTI32" or
+                     "VCmpTU32" or "VCmpxTU32")
             {
                 condition = "true";
             }
-            else if (opcode is "VCmpFF32" or "VCmpxFF32" or "VCmpFI32" or "VCmpFU32")
+            else if (opcode is
+                     "VCmpFF32" or "VCmpxFF32" or
+                     "VCmpFF16" or "VCmpxFF16" or
+                     "VCmpFI32" or "VCmpxFI32" or
+                     "VCmpFU32" or "VCmpxFU32")
             {
                 condition = "false";
             }
-            else if (opcode is "VCmpOF32" or "VCmpxOF32")
+            else if (opcode is
+                     "VCmpOF32" or "VCmpxOF32" or
+                     "VCmpOF16" or "VCmpxOF16")
             {
-                condition = $"(!isnan({F(instruction, 0)}) && !isnan({F(instruction, 1)}))";
+                var left = opcode.EndsWith("F16", StringComparison.Ordinal)
+                    ? EmitScalarF16Operand(instruction, 0)
+                    : F(instruction, 0);
+                var right = opcode.EndsWith("F16", StringComparison.Ordinal)
+                    ? EmitScalarF16Operand(instruction, 1)
+                    : F(instruction, 1);
+                condition = $"(!isnan({left}) && !isnan({right}))";
             }
-            else if (opcode is "VCmpUF32" or "VCmpxUF32")
+            else if (opcode is
+                      "VCmpUF32" or "VCmpxUF32" or
+                     "VCmpUF16" or "VCmpxUF16")
             {
-                condition = $"(isnan({F(instruction, 0)}) || isnan({F(instruction, 1)}))";
+                var left = opcode.EndsWith("F16", StringComparison.Ordinal)
+                    ? EmitScalarF16Operand(instruction, 0)
+                    : F(instruction, 0);
+                var right = opcode.EndsWith("F16", StringComparison.Ordinal)
+                    ? EmitScalarF16Operand(instruction, 1)
+                    : F(instruction, 1);
+                condition = $"(isnan({left}) || isnan({right}))";
             }
-            else if (opcode.EndsWith("F32", StringComparison.Ordinal))
+            else if (opcode.EndsWith("I64", StringComparison.Ordinal) ||
+                     opcode.EndsWith("U64", StringComparison.Ordinal))
+            {
+                var signed = opcode.EndsWith("I64", StringComparison.Ordinal);
+                var left = Temp(
+                    signed ? "long" : "ulong",
+                    signed
+                        ? $"as_type<long>({RawSource64(instruction, 0)})"
+                        : RawSource64(instruction, 0));
+                var right = Temp(
+                    signed ? "long" : "ulong",
+                    signed
+                        ? $"as_type<long>({RawSource64(instruction, 1)})"
+                        : RawSource64(instruction, 1));
+                var op = TrimCompare(opcode) switch
+                {
+                    "Eq" => "==",
+                    "Ne" => "!=",
+                    "Lt" => "<",
+                    "Le" => "<=",
+                    "Gt" => ">",
+                    "Ge" => ">=",
+                    _ => string.Empty,
+                };
+                condition = op.Length != 0
+                    ? $"({left} {op} {right})"
+                    : TrimCompare(opcode) switch
+                    {
+                        "F" => "false",
+                        "T" => "true",
+                        _ => string.Empty,
+                    };
+                if (condition.Length == 0)
+                {
+                    error = $"unsupported integer 64-bit compare {opcode}";
+                    return false;
+                }
+            }
+            else if (opcode.EndsWith("F32", StringComparison.Ordinal) ||
+                     opcode.EndsWith("F16", StringComparison.Ordinal))
             {
                 // Ordered compares are the plain C operators (false on NaN);
                 // the Nxx forms are their unordered negations (true on NaN).
@@ -620,12 +2516,21 @@ public static partial class Gen5MslTranslator
                     return false;
                 }
 
-                var comparison = $"({F(instruction, 0)} {op} {F(instruction, 1)})";
+                var left = opcode.EndsWith("F16", StringComparison.Ordinal)
+                    ? EmitScalarF16Operand(instruction, 0)
+                    : F(instruction, 0);
+                var right = opcode.EndsWith("F16", StringComparison.Ordinal)
+                    ? EmitScalarF16Operand(instruction, 1)
+                    : F(instruction, 1);
+                var comparison = $"({left} {op} {right})";
                 condition = unordered ? $"(!{comparison})" : comparison;
             }
             else
             {
-                var signed = opcode.EndsWith("I32", StringComparison.Ordinal);
+                var is16 = opcode.EndsWith("I16", StringComparison.Ordinal) ||
+                           opcode.EndsWith("U16", StringComparison.Ordinal);
+                var signed = opcode.EndsWith("I32", StringComparison.Ordinal) ||
+                             opcode.EndsWith("I16", StringComparison.Ordinal);
                 var op = TrimCompare(opcode) switch
                 {
                     "Eq" => "==",
@@ -642,9 +2547,19 @@ public static partial class Gen5MslTranslator
                     return false;
                 }
 
-                condition = signed
-                    ? $"(as_type<int>({RawSource(instruction, 0)}) {op} as_type<int>({RawSource(instruction, 1)}))"
-                    : $"(({RawSource(instruction, 0)}) {op} ({RawSource(instruction, 1)}))";
+                var left = is16 && instruction.Control is Gen5Vop3Control halfControl
+                    ? EmitVop3HalfBits(instruction, halfControl, 0)
+                    : RawSource(instruction, 0);
+                var right = is16 && instruction.Control is Gen5Vop3Control rightHalfControl
+                    ? EmitVop3HalfBits(instruction, rightHalfControl, 1)
+                    : RawSource(instruction, 1);
+                condition = (signed, is16) switch
+                {
+                    (true, true) => $"((short)(({left}) & 0xFFFFu) {op} (short)(({right}) & 0xFFFFu))",
+                    (false, true) => $"((ushort)(({left}) & 0xFFFFu) {op} (ushort)(({right}) & 0xFFFFu))",
+                    (true, false) => $"(as_type<int>({left}) {op} as_type<int>({right}))",
+                    _ => $"(({left}) {op} ({right}))",
+                };
             }
 
             // Only EXEC-enabled lanes can pass; balloting the raw condition
@@ -664,28 +2579,127 @@ public static partial class Gen5MslTranslator
             }
             else
             {
-                var target = instruction.Control is Gen5SdwaControl
-                    { ScalarDestination: { } scalarDestination }
-                    ? scalarDestination
-                    : VccLoRegister;
+                var target = instruction.Control switch
+                {
+                    Gen5SdwaControl { ScalarDestination: { } scalarDestination } =>
+                        scalarDestination,
+                    Gen5Vop3Control { ScalarDestination: { } scalarDestination } =>
+                        scalarDestination,
+                    _ => VccLoRegister,
+                };
                 StoreMaskBit(target, active);
             }
 
             return true;
         }
 
+        private string EmitFloat64Compare(Gen5ShaderInstruction instruction)
+        {
+            var left = Temp("ulong", Float64SourceBits(instruction, 0));
+            var right = Temp("ulong", Float64SourceBits(instruction, 1));
+            var leftNan = Temp(
+                "bool",
+                $"(({left} & 0x7FF0000000000000ul) == 0x7FF0000000000000ul) && " +
+                $"(({left} & 0x000FFFFFFFFFFFFFul) != 0ul)");
+            var rightNan = Temp(
+                "bool",
+                $"(({right} & 0x7FF0000000000000ul) == 0x7FF0000000000000ul) && " +
+                $"(({right} & 0x000FFFFFFFFFFFFFul) != 0ul)");
+            var unordered = Temp("bool", $"{leftNan} || {rightNan}");
+            var ordered = Temp("bool", $"!{unordered}");
+            var bothZero = Temp(
+                "bool",
+                $"(({left} & 0x7FFFFFFFFFFFFFFFul) == 0ul) && " +
+                $"(({right} & 0x7FFFFFFFFFFFFFFFul) == 0ul)");
+            var equal = Temp("bool", $"{ordered} && (({left} == {right}) || {bothZero})");
+            var leftKey = Temp(
+                "ulong",
+                $"(({left} & 0x8000000000000000ul) != 0ul) ? ~{left} : ({left} ^ 0x8000000000000000ul)");
+            var rightKey = Temp(
+                "ulong",
+                $"(({right} & 0x8000000000000000ul) != 0ul) ? ~{right} : ({right} ^ 0x8000000000000000ul)");
+            var less = Temp("bool", $"{ordered} && ({leftKey} < {rightKey})");
+            var greater = Temp("bool", $"{ordered} && ({leftKey} > {rightKey})");
+            var lessEqual = Temp("bool", $"{less} || {equal}");
+            var greaterEqual = Temp("bool", $"{greater} || {equal}");
+            var lessGreater = Temp("bool", $"{less} || {greater}");
+            return TrimCompare(instruction.Opcode) switch
+            {
+                "F" => "false",
+                "Lt" => less,
+                "Eq" => equal,
+                "Le" => lessEqual,
+                "Gt" => greater,
+                "Lg" => lessGreater,
+                "Ge" => greaterEqual,
+                "O" => ordered,
+                "U" => unordered,
+                "Nge" => $"!{greaterEqual}",
+                "Nlg" => $"!{lessGreater}",
+                "Ngt" => $"!{greater}",
+                "Nle" => $"!{lessEqual}",
+                "Neq" => $"!{equal}",
+                "Nlt" => $"!{less}",
+                "Tru" => "true",
+                _ => "false",
+            };
+        }
+
+        private string Float64SourceBits(
+            Gen5ShaderInstruction instruction,
+            int sourceIndex)
+        {
+            var operand = instruction.Sources[sourceIndex];
+            double? constant = operand.Kind == Gen5OperandKind.EncodedConstant
+                ? operand.Value switch
+                {
+                    125 => 0.0,
+                    >= 128 and <= 192 => operand.Value - 128,
+                    >= 193 and <= 208 => -(double)(operand.Value - 192),
+                    >= 240 and <= 248 when Gen5InlineConstants.TryDecode(
+                        operand.Value,
+                        out var floatBits) => BitConverter.UInt32BitsToSingle(floatBits),
+                    _ => null,
+                }
+                : null;
+            var bits = constant.HasValue
+                ? $"0x{BitConverter.DoubleToUInt64Bits(constant.Value):X16}ul"
+                : RawSource64(instruction, sourceIndex);
+            if (instruction.Control is Gen5Vop3Control control)
+            {
+                if ((control.AbsoluteMask & (1u << sourceIndex)) != 0)
+                {
+                    bits = $"(({bits}) & 0x7FFFFFFFFFFFFFFFul)";
+                }
+
+                if ((control.NegateMask & (1u << sourceIndex)) != 0)
+                {
+                    bits = $"(({bits}) ^ 0x8000000000000000ul)";
+                }
+            }
+
+            return bits;
+        }
+
         private string EmitCompareClass(Gen5ShaderInstruction instruction)
         {
-            var source = Temp("float", F(instruction, 0));
-            var raw = Temp("uint", RawSource(instruction, 0));
+            var half = instruction.Opcode.EndsWith("F16", StringComparison.Ordinal);
+            var source = Temp(
+                half ? "half" : "float",
+                half ? EmitScalarF16Operand(instruction, 0) : F(instruction, 0));
+            var raw = Temp(
+                "uint",
+                half ? EmitScalarF16SourceBits(instruction, 0) : RawSource(instruction, 0));
             var mask = Temp("uint", RawSource(instruction, 1));
-            var negative = Temp("bool", $"({raw} & 0x80000000u) != 0u");
+            var negative = Temp("bool", $"({raw} & {(half ? "0x8000u" : "0x80000000u")}) != 0u");
             var nan = Temp("bool", $"isnan({source})");
             var infinite = Temp("bool", $"isinf({source})");
-            var zero = Temp("bool", $"{source} == 0.0f");
+            var zero = Temp("bool", $"{source} == {(half ? "half(0.0f)" : "0.0f")}");
             var subnormal = Temp(
                 "bool",
-                $"fabs({source}) > 0.0f && fabs({source}) < as_type<float>(0x00800000u)");
+                half
+                    ? $"fabs({source}) > half(0.0f) && fabs({source}) < as_type<half>((ushort)0x0400)"
+                    : $"fabs({source}) > 0.0f && fabs({source}) < as_type<float>(0x00800000u)");
             var normal = Temp(
                 "bool",
                 $"!({nan} || {infinite} || {zero} || {subnormal})");
@@ -952,8 +2966,15 @@ public static partial class Gen5MslTranslator
                 return true;
             }
 
+            if (instruction.Opcode is
+                "SMovrelsB32" or "SMovrelsB64" or
+                "SMovreldB32" or "SMovreldB64")
+            {
+                return TryEmitScalarRelativeMove(instruction, destination, out error);
+            }
+
             if (instruction.Opcode.EndsWith("B64", StringComparison.Ordinal) ||
-                instruction.Opcode is "SBfeU64" or "SBfeI64")
+                instruction.Opcode is "SBfeU64" or "SBfeI64" or "SAshrI64")
             {
                 return TryEmitScalar64(instruction, destination, out error);
             }
@@ -1088,6 +3109,11 @@ public static partial class Gen5MslTranslator
                     resultExpression = $"mulhi({left}, {right})";
                     sccStatement = string.Empty;
                     break;
+                case "SMulHiI32":
+                    resultExpression =
+                        $"as_type<uint>((int)(((long)as_type<int>({left}) * (long)as_type<int>({right})) >> 32))";
+                    sccStatement = string.Empty;
+                    break;
                 case "SAndB32":
                     resultExpression = $"({left} & {right})";
                     sccStatement = "NONZERO";
@@ -1132,6 +3158,14 @@ public static partial class Gen5MslTranslator
                     resultExpression = $"(uint)(as_type<int>({left}) >> ({right} & 31u))";
                     sccStatement = "NONZERO";
                     break;
+                case "SAbsdiffI32":
+                {
+                    var difference = Temp("uint", $"{left} - {right}");
+                    resultExpression =
+                        $"(({difference} & 0x80000000u) != 0u ? (0u - {difference}) : {difference})";
+                    sccStatement = "NONZERO";
+                    break;
+                }
                 case "SBfmB32":
                     resultExpression = $"(((1u << ({left} & 31u)) - 1u) << ({right} & 31u))";
                     sccStatement = string.Empty;
@@ -1238,6 +3272,16 @@ public static partial class Gen5MslTranslator
                 return true;
             }
 
+            if (instruction.Opcode is "SBitcmp0B64" or "SBitcmp1B64")
+            {
+                var wideLeft = Temp("ulong", RawSource64(instruction, 0));
+                var isSet = $"(({wideLeft} >> (ulong({right}) & 63ul)) & 1ul) != 0ul";
+                Line(instruction.Opcode == "SBitcmp1B64"
+                    ? $"scc = {isSet};"
+                    : $"scc = !({isSet});");
+                return true;
+            }
+
             return TryEmitScalarCompareCore(instruction.Opcode, "SCmp", left, right, out error);
         }
 
@@ -1282,6 +3326,56 @@ public static partial class Gen5MslTranslator
             Line(signed
                 ? $"scc = as_type<int>({left}) {op} as_type<int>({right});"
                 : $"scc = ({left}) {op} ({right});");
+            return true;
+        }
+
+        private bool TryEmitScalarRelativeMove(
+            Gen5ShaderInstruction instruction,
+            uint destination,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Sources.Count != 1 ||
+                instruction.Sources[0].Kind != Gen5OperandKind.ScalarRegister)
+            {
+                error = $"{instruction.Opcode} expects an SGPR source base";
+                return false;
+            }
+
+            const uint m0Register = 124;
+            var m0 = Temp("uint", $"s[{m0Register}]");
+            var relativeSource = instruction.Opcode.StartsWith(
+                "SMovrels",
+                StringComparison.Ordinal);
+            var is64 = instruction.Opcode.EndsWith("B64", StringComparison.Ordinal);
+            var source = instruction.Sources[0].Value;
+
+            var low = relativeSource
+                ? LoadScalarRelative(source, m0)
+                : Temp("uint", ScalarExpression(source));
+            var high = is64
+                ? relativeSource
+                    ? LoadScalarRelative(source + 1, m0)
+                    : Temp("uint", ScalarExpression(source + 1))
+                : string.Empty;
+
+            if (relativeSource)
+            {
+                StoreScalar(destination, low);
+                if (is64)
+                {
+                    StoreScalar(destination + 1, high);
+                }
+            }
+            else
+            {
+                StoreScalarRelative(destination, m0, low);
+                if (is64)
+                {
+                    StoreScalarRelative(destination + 1, m0, high);
+                }
+            }
+
             return true;
         }
 
@@ -1350,12 +3444,15 @@ public static partial class Gen5MslTranslator
                     value = $"({quadAny} * 0xFul)";
                     break;
                 }
-                case "SLshlB64" or "SLshrB64":
+                case "SLshlB64" or "SLshrB64" or "SAshrI64":
                 {
                     var shift = Temp("uint", $"({RawSource(instruction, 1)}) & 63u");
-                    value = instruction.Opcode == "SLshlB64"
-                        ? $"({left} << {shift})"
-                        : $"({left} >> {shift})";
+                    value = instruction.Opcode switch
+                    {
+                        "SLshlB64" => $"({left} << {shift})",
+                        "SLshrB64" => $"({left} >> {shift})",
+                        _ => $"as_type<ulong>(as_type<long>({left}) >> {shift})",
+                    };
                     break;
                 }
                 case "SBfmB64":

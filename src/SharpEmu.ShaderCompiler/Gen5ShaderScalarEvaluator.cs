@@ -181,6 +181,7 @@ public static class Gen5ShaderScalarEvaluator
     public static ArrayPool<byte> GlobalMemoryPool { get; set; } = ArrayPool<byte>.Shared;
 
     private const int ScalarRegisterCount = 256;
+    private const uint ArchitecturalScalarRegisterCount = 128;
     private const int ImageDescriptorDwords = 8;
     private const int SamplerDescriptorDwords = 4;
     private const int MaxGlobalMemoryBindingBytes = 16 * 1024 * 1024;
@@ -1359,6 +1360,17 @@ public static class Gen5ShaderScalarEvaluator
             return true;
         }
 
+        if (instruction.Opcode is
+            "SMovrelsB32" or "SMovrelsB64" or
+            "SMovreldB32" or "SMovreldB64")
+        {
+            return TryExecuteScalarRelativeMove(
+                instruction,
+                registers,
+                ref execMask,
+                out error);
+        }
+
         if (TryExecuteSaveExecScalarAlu(
                 instruction,
                 registers,
@@ -1399,7 +1411,7 @@ public static class Gen5ShaderScalarEvaluator
             return true;
         }
 
-        if (instruction.Opcode is "SLshlB64" or "SLshrB64")
+        if (instruction.Opcode is "SLshlB64" or "SLshrB64" or "SAshrI64")
         {
             if (instruction.Sources.Count < 2 ||
                 destination.Value >= ScalarRegisterCount - 1 ||
@@ -1417,9 +1429,12 @@ public static class Gen5ShaderScalarEvaluator
                 return false;
             }
 
-            value = instruction.Opcode == "SLshlB64"
-                ? value << ((int)shift & 63)
-                : value >> ((int)shift & 63);
+            value = instruction.Opcode switch
+            {
+                "SLshlB64" => value << ((int)shift & 63),
+                "SLshrB64" => value >> ((int)shift & 63),
+                _ => unchecked((ulong)((long)value >> ((int)shift & 63))),
+            };
             WriteScalarPair(registers, destination.Value, value, ref execMask);
             scalarConditionCode = value != 0;
             return true;
@@ -1721,7 +1736,13 @@ public static class Gen5ShaderScalarEvaluator
                     break;
                 }
             case "SAbsdiffI32":
-                result = unchecked((uint)Math.Abs((long)(int)left - (int)right));
+                // The subtraction is a wrapping i32 operation before the sign
+                // test/negation.  In particular abs(INT_MIN) remains INT_MIN.
+                result = unchecked(left - right);
+                if ((result & 0x8000_0000u) != 0)
+                {
+                    result = unchecked(0u - result);
+                }
                 scalarConditionCode = result != 0;
                 break;
             case "SLshl1AddU32":
@@ -1773,6 +1794,68 @@ public static class Gen5ShaderScalarEvaluator
         }
 
         registers[destination.Value] = result;
+        if (destination.Value is 126 or 127)
+        {
+            execMask = MaskWaveValue(
+                registers[126] | ((ulong)registers[127] << 32));
+        }
+        return true;
+    }
+
+    private static bool TryExecuteScalarRelativeMove(
+        Gen5ShaderInstruction instruction,
+        uint[] registers,
+        ref ulong execMask,
+        out string error)
+    {
+        error = string.Empty;
+        if (instruction.Destinations.Count != 1 ||
+            instruction.Destinations[0].Kind != Gen5OperandKind.ScalarRegister ||
+            instruction.Sources.Count != 1 ||
+            instruction.Sources[0].Kind != Gen5OperandKind.ScalarRegister)
+        {
+            error = $"scalar-relative-operands pc=0x{instruction.Pc:X} op={instruction.Opcode}";
+            return false;
+        }
+
+        var destinationBase = instruction.Destinations[0].Value;
+        var sourceBase = instruction.Sources[0].Value;
+        var m0 = registers[124];
+        var relativeSource = instruction.Opcode.StartsWith(
+            "SMovrels",
+            StringComparison.Ordinal);
+        var is64 = instruction.Opcode.EndsWith("B64", StringComparison.Ordinal);
+        var sourceIndex = relativeSource
+            ? unchecked(sourceBase + m0)
+            : sourceBase;
+        var destinationIndex = relativeSource
+            ? destinationBase
+            : unchecked(destinationBase + m0);
+
+        var low = sourceIndex < ArchitecturalScalarRegisterCount
+            ? registers[sourceIndex]
+            : 0u;
+        var high = is64 && sourceIndex < ArchitecturalScalarRegisterCount - 1
+            ? registers[sourceIndex + 1]
+            : 0u;
+
+        if (destinationIndex < ArchitecturalScalarRegisterCount)
+        {
+            registers[destinationIndex] = low;
+        }
+
+        if (is64 && destinationIndex < ArchitecturalScalarRegisterCount - 1)
+        {
+            registers[destinationIndex + 1] = high;
+        }
+
+        if (destinationIndex <= 127 &&
+            destinationIndex + (is64 ? 1u : 0u) >= 126)
+        {
+            execMask = MaskWaveValue(
+                registers[126] | ((ulong)registers[127] << 32));
+        }
+
         return true;
     }
 

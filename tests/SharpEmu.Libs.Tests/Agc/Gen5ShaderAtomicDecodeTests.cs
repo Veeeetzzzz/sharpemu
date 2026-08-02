@@ -63,6 +63,33 @@ public sealed class Gen5ShaderAtomicDecodeTests
         Assert.Equal(new[] { Gen5Operand.Vector(2) }, instruction.Destinations);
     }
 
+    [Theory]
+    [InlineData(0x30u, "GlobalAtomicSwap")]
+    [InlineData(0x31u, "GlobalAtomicCmpswap")]
+    [InlineData(0x32u, "GlobalAtomicAdd")]
+    [InlineData(0x33u, "GlobalAtomicSub")]
+    [InlineData(0x34u, "GlobalAtomicCsub")]
+    [InlineData(0x35u, "GlobalAtomicSmin")]
+    [InlineData(0x36u, "GlobalAtomicUmin")]
+    [InlineData(0x37u, "GlobalAtomicSmax")]
+    [InlineData(0x38u, "GlobalAtomicUmax")]
+    [InlineData(0x39u, "GlobalAtomicAnd")]
+    [InlineData(0x3Au, "GlobalAtomicOr")]
+    [InlineData(0x3Bu, "GlobalAtomicXor")]
+    [InlineData(0x3Cu, "GlobalAtomicInc")]
+    [InlineData(0x3Du, "GlobalAtomicDec")]
+    public void GlobalAtomicFamilyDecodes(uint opcode, string expected)
+    {
+        const uint globalTemplate = 0xDC008000u;
+        var word = globalTemplate | (opcode << 18);
+        var instruction = DecodeSingle(word, 0x00000100u);
+
+        Assert.Equal(expected, instruction.Opcode);
+        var control = Assert.IsType<Gen5GlobalMemoryControl>(instruction.Control);
+        Assert.Equal(1u, control.DwordCount);
+        Assert.False(control.UsesFlatAddress);
+    }
+
     [Fact]
     public void DsAddU32_HasAddressAndDataSourcesButNoDestination()
     {

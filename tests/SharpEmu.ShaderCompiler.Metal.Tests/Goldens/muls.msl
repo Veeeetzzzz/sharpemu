@@ -61,6 +61,20 @@ static inline void sharpemu_store_bytes(device uint* b, uint bytes, uint addr, u
     }
 }
 
+static inline uint sharpemu_perm_byte(uint high, uint low, uint selector)
+{
+    if (selector < 8u)
+    {
+        uint source = selector < 4u ? low : high;
+        return (source >> ((selector & 3u) * 8u)) & 0xFFu;
+    }
+    if (selector == 8u) return (low & 0x00008000u) != 0u ? 0xFFu : 0u;
+    if (selector == 9u) return (low & 0x80000000u) != 0u ? 0xFFu : 0u;
+    if (selector == 10u) return (high & 0x00008000u) != 0u ? 0xFFu : 0u;
+    if (selector == 11u) return (high & 0x80000000u) != 0u ? 0xFFu : 0u;
+    return selector == 12u ? 0u : 0xFFu;
+}
+
 static inline uint sharpemu_ballot(bool value)
 {
     return (uint)(uint64_t)simd_ballot(value);

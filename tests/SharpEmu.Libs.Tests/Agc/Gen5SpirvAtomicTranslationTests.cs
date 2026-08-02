@@ -31,7 +31,8 @@ public sealed class Gen5SpirvAtomicTranslationTests
 
         Assert.Contains((ushort)SpirvOp.AtomicUMax, opcodes);
         Assert.Contains((ushort)SpirvOp.AtomicCompareExchange, opcodes);
-        Assert.Contains((ushort)SpirvOp.AtomicIIncrement, opcodes);
+        Assert.Contains((ushort)SpirvOp.LoopMerge, opcodes);
+        Assert.DoesNotContain((ushort)SpirvOp.AtomicIIncrement, opcodes);
     }
 
     [Fact]
@@ -51,6 +52,22 @@ public sealed class Gen5SpirvAtomicTranslationTests
         Assert.Contains((ushort)SpirvOp.AtomicUMax, opcodes);
     }
 
+    [Theory]
+    [InlineData(0xD80C0000u, SpirvOp.AtomicIIncrement)] // DS_INC_U32 v0, v1
+    [InlineData(0xD8100000u, SpirvOp.AtomicIDecrement)] // DS_DEC_U32 v0, v1
+    public void BoundedDataShareAtomics_UseExactCompareExchangeLoop(
+        uint instruction,
+        SpirvOp forbiddenApproximation)
+    {
+        var opcodes = CompileCompute(
+            [instruction, 0x00000100],
+            new Dictionary<uint, uint>());
+
+        Assert.Contains((ushort)SpirvOp.AtomicCompareExchange, opcodes);
+        Assert.Contains((ushort)SpirvOp.LoopMerge, opcodes);
+        Assert.DoesNotContain((ushort)forbiddenApproximation, opcodes);
+    }
+
     [Fact]
     public void ImageAtomicAdd_EmitsTexelPointerAndAtomicAdd()
     {
@@ -65,6 +82,38 @@ public sealed class Gen5SpirvAtomicTranslationTests
 
         Assert.Contains((ushort)SpirvOp.ImageTexelPointer, opcodes);
         Assert.Contains((ushort)SpirvOp.AtomicIAdd, opcodes);
+    }
+
+    [Fact]
+    public void GlobalIntegerAtomicFamilyTranslates()
+    {
+        const uint globalTemplate = 0xDC018000u; // GLOBAL, GLC=1
+        uint[] atomicOpcodes =
+        [
+            0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
+            0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D,
+        ];
+        var words = atomicOpcodes
+            .SelectMany(opcode => new[]
+            {
+                globalTemplate | (opcode << 18),
+                0x00000100u,
+            })
+            .ToArray();
+        var opcodes = CompileCompute(words, BufferDescriptorRegisters());
+
+        Assert.Contains((ushort)SpirvOp.AtomicExchange, opcodes);
+        Assert.Contains((ushort)SpirvOp.AtomicCompareExchange, opcodes);
+        Assert.Contains((ushort)SpirvOp.AtomicIAdd, opcodes);
+        Assert.Contains((ushort)SpirvOp.AtomicISub, opcodes);
+        Assert.Contains((ushort)SpirvOp.AtomicSMin, opcodes);
+        Assert.Contains((ushort)SpirvOp.AtomicUMin, opcodes);
+        Assert.Contains((ushort)SpirvOp.AtomicSMax, opcodes);
+        Assert.Contains((ushort)SpirvOp.AtomicUMax, opcodes);
+        Assert.Contains((ushort)SpirvOp.AtomicAnd, opcodes);
+        Assert.Contains((ushort)SpirvOp.AtomicOr, opcodes);
+        Assert.Contains((ushort)SpirvOp.AtomicXor, opcodes);
+        Assert.Contains((ushort)SpirvOp.LoopMerge, opcodes);
     }
 
     private static Dictionary<uint, uint> BufferDescriptorRegisters() => new()
