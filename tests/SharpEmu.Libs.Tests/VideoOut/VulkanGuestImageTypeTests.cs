@@ -46,4 +46,34 @@ public sealed class VulkanGuestImageTypeTests
                 VulkanVideoPresenter.Gen5TextureType2D,
                 7));
     }
+
+    [Fact]
+    public void TwoDimensionalMipExtentsKeepDepthAtOne()
+    {
+        var extent = VulkanVideoPresenter.GetGuestImageMipExtent(
+            width: 128,
+            height: 64,
+            depth: 7,
+            type: VulkanVideoPresenter.Gen5TextureType2D,
+            mipLevel: 1);
+
+        Assert.Equal(64u, extent.Width);
+        Assert.Equal(32u, extent.Height);
+        Assert.Equal(1u, extent.Depth);
+    }
+
+    [Fact]
+    public void ThreeDimensionalMipExtentsShrinkDepthWithTheMip()
+    {
+        var extent = VulkanVideoPresenter.GetGuestImageMipExtent(
+            width: 128,
+            height: 64,
+            depth: 4,
+            type: VulkanVideoPresenter.Gen5TextureType3D,
+            mipLevel: 1);
+
+        Assert.Equal(64u, extent.Width);
+        Assert.Equal(32u, extent.Height);
+        Assert.Equal(2u, extent.Depth);
+    }
 }

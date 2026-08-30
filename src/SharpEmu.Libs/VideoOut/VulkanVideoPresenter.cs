@@ -244,6 +244,24 @@ internal static unsafe class VulkanVideoPresenter
     internal static uint GetGuestTextureDepth(uint type, uint depth) =>
         IsGuestTexture3D(type) ? Math.Max(depth, 1u) : 1u;
 
+    internal static (uint Width, uint Height, uint Depth) GetGuestImageMipExtent(
+        uint width,
+        uint height,
+        uint depth,
+        uint type,
+        uint mipLevel) =>
+        (
+            GetMipDimension(width, mipLevel),
+            GetMipDimension(height, mipLevel),
+            IsGuestTexture3D(type)
+                ? GetMipDimension(depth, mipLevel)
+                : 1u);
+
+    private static uint GetMipDimension(uint dimension, uint mipLevel) =>
+        mipLevel >= 32
+            ? 1
+            : Math.Max(dimension >> (int)mipLevel, 1u);
+
     internal static ImageType GetGuestTextureImageType(uint type) =>
         IsGuestTexture3D(type) ? ImageType.Type3D : ImageType.Type2D;
 
@@ -14722,22 +14740,19 @@ internal static unsafe class VulkanVideoPresenter
             return Math.Min(Math.Max(requestedMipLevels, 1u), maximumMipLevels);
         }
 
-        private static uint GetMipDimension(uint dimension, uint mipLevel) =>
-            mipLevel >= 32
-                ? 1
-                : Math.Max(dimension >> (int)mipLevel, 1u);
         private unsafe (Image Image, DeviceMemory Memory) CreateTransferScratchImage(
             Format format,
-            uint width,
-            uint height)
+            ImageType imageType,
+            Extent3D extent,
+            uint mipLevels)
         {
             var imageInfo = new ImageCreateInfo
             {
                 SType = StructureType.ImageCreateInfo,
-                ImageType = ImageType.Type2D,
+                ImageType = imageType,
                 Format = format,
-                Extent = new Extent3D(width, height, 1),
-                MipLevels = 1,
+                Extent = extent,
+                MipLevels = mipLevels,
                 ArrayLayers = 1,
                 Samples = SampleCountFlags.Count1Bit,
                 Tiling = ImageTiling.Optimal,
@@ -14780,14 +14795,28 @@ internal static unsafe class VulkanVideoPresenter
             FlushBatchedGuestCommands();
             WaitForAllGuestSubmissions();
 
+            var imageType = GetGuestTextureImageType(resource.Type);
+            var mipLevels = Math.Max(resource.MipLevels, 1u);
+            var fullExtent = GetGuestImageMipExtent(
+                resource.Width,
+                resource.Height,
+                resource.Depth,
+                resource.Type,
+                mipLevel: 0);
+            var scratchExtent = new Extent3D(
+                fullExtent.Width,
+                fullExtent.Height,
+                fullExtent.Depth);
             var (oldTyped, oldMemory) = CreateTransferScratchImage(
                 fromFormat,
-                resource.Width,
-                resource.Height);
+                imageType,
+                scratchExtent,
+                mipLevels);
             var (newTyped, newMemory) = CreateTransferScratchImage(
                 toFormat,
-                resource.Width,
-                resource.Height);
+                imageType,
+                scratchExtent,
+                mipLevels);
             CommandBuffer commandBuffer = default;
             var submitted = false;
             var completed = false;
@@ -14803,158 +14832,179 @@ internal static unsafe class VulkanVideoPresenter
                     _vk.BeginCommandBuffer(commandBuffer, &beginInfo),
                     "vkBeginCommandBuffer(format-convert)");
 
-                var toTransferSrc = new ImageMemoryBarrier
+                for (uint mipLevel = 0; mipLevel < mipLevels; mipLevel++)
                 {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = AccessFlags.MemoryWriteBit,
-                    DstAccessMask = AccessFlags.TransferReadBit,
-                    OldLayout = ImageLayout.General,
-                    NewLayout = ImageLayout.TransferSrcOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = resource.Image,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
-                };
-                _vk.CmdPipelineBarrier(
-                    commandBuffer, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit,
-                    0, 0, null, 0, null, 1, &toTransferSrc);
+                    var mipExtent = GetGuestImageMipExtent(
+                        resource.Width,
+                        resource.Height,
+                        resource.Depth,
+                        resource.Type,
+                        mipLevel);
+                    var resourceRange = ColorSubresourceRange(mipLevel, 1);
+                    var scratchRange = ColorSubresourceRange(mipLevel, 1);
 
-                var oldTypedToDst = new ImageMemoryBarrier
-                {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = 0,
-                    DstAccessMask = AccessFlags.TransferWriteBit,
-                    OldLayout = ImageLayout.Undefined,
-                    NewLayout = ImageLayout.TransferDstOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = oldTyped,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
-                };
-                _vk.CmdPipelineBarrier(
-                    commandBuffer, PipelineStageFlags.TopOfPipeBit, PipelineStageFlags.TransferBit,
-                    0, 0, null, 0, null, 1, &oldTypedToDst);
-
-                var copyRegion = new ImageCopy
-                {
-                    SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
-                    SrcOffset = new Offset3D(0, 0, 0),
-                    DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
-                    DstOffset = new Offset3D(0, 0, 0),
-                    Extent = new Extent3D(resource.Width, resource.Height, 1),
-                };
-                _vk.CmdCopyImage(
-                    commandBuffer,
-                    resource.Image, ImageLayout.TransferSrcOptimal,
-                    oldTyped, ImageLayout.TransferDstOptimal,
-                    1, &copyRegion);
-
-                var oldTypedToSrc = new ImageMemoryBarrier
-                {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = AccessFlags.TransferWriteBit,
-                    DstAccessMask = AccessFlags.TransferReadBit,
-                    OldLayout = ImageLayout.TransferDstOptimal,
-                    NewLayout = ImageLayout.TransferSrcOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = oldTyped,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
-                };
-                _vk.CmdPipelineBarrier(
-                    commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit,
-                    0, 0, null, 0, null, 1, &oldTypedToSrc);
-
-                var newTypedToDst = new ImageMemoryBarrier
-                {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = 0,
-                    DstAccessMask = AccessFlags.TransferWriteBit,
-                    OldLayout = ImageLayout.Undefined,
-                    NewLayout = ImageLayout.TransferDstOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = newTyped,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
-                };
-                _vk.CmdPipelineBarrier(
-                    commandBuffer, PipelineStageFlags.TopOfPipeBit, PipelineStageFlags.TransferBit,
-                    0, 0, null, 0, null, 1, &newTypedToDst);
-
-                var blitRegion = new ImageBlit
-                {
-                    SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
-                    SrcOffsets = new ImageBlit.SrcOffsetsBuffer
+                    var toTransferSrc = new ImageMemoryBarrier
                     {
-                        Element0 = new Offset3D(0, 0, 0),
-                        Element1 = new Offset3D(checked((int)resource.Width), checked((int)resource.Height), 1),
-                    },
-                    DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
-                    DstOffsets = new ImageBlit.DstOffsetsBuffer
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = AccessFlags.MemoryWriteBit,
+                        DstAccessMask = AccessFlags.TransferReadBit,
+                        OldLayout = ImageLayout.General,
+                        NewLayout = ImageLayout.TransferSrcOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = resource.Image,
+                        SubresourceRange = resourceRange,
+                    };
+                    _vk.CmdPipelineBarrier(
+                        commandBuffer, PipelineStageFlags.AllCommandsBit, PipelineStageFlags.TransferBit,
+                        0, 0, null, 0, null, 1, &toTransferSrc);
+
+                    var oldTypedToDst = new ImageMemoryBarrier
                     {
-                        Element0 = new Offset3D(0, 0, 0),
-                        Element1 = new Offset3D(checked((int)resource.Width), checked((int)resource.Height), 1),
-                    },
-                };
-                _vk.CmdBlitImage(
-                    commandBuffer,
-                    oldTyped, ImageLayout.TransferSrcOptimal,
-                    newTyped, ImageLayout.TransferDstOptimal,
-                    1, &blitRegion, Filter.Nearest);
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = 0,
+                        DstAccessMask = AccessFlags.TransferWriteBit,
+                        OldLayout = ImageLayout.Undefined,
+                        NewLayout = ImageLayout.TransferDstOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = oldTyped,
+                        SubresourceRange = scratchRange,
+                    };
+                    _vk.CmdPipelineBarrier(
+                        commandBuffer, PipelineStageFlags.TopOfPipeBit, PipelineStageFlags.TransferBit,
+                        0, 0, null, 0, null, 1, &oldTypedToDst);
 
-                var newTypedToSrc = new ImageMemoryBarrier
-                {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = AccessFlags.TransferWriteBit,
-                    DstAccessMask = AccessFlags.TransferReadBit,
-                    OldLayout = ImageLayout.TransferDstOptimal,
-                    NewLayout = ImageLayout.TransferSrcOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = newTyped,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
-                };
-                _vk.CmdPipelineBarrier(
-                    commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit,
-                    0, 0, null, 0, null, 1, &newTypedToSrc);
+                    var copyRegion = new ImageCopy
+                    {
+                        SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, mipLevel, 0, 1),
+                        SrcOffset = new Offset3D(0, 0, 0),
+                        DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, mipLevel, 0, 1),
+                        DstOffset = new Offset3D(0, 0, 0),
+                        Extent = new Extent3D(
+                            mipExtent.Width,
+                            mipExtent.Height,
+                            mipExtent.Depth),
+                    };
+                    _vk.CmdCopyImage(
+                        commandBuffer,
+                        resource.Image, ImageLayout.TransferSrcOptimal,
+                        oldTyped, ImageLayout.TransferDstOptimal,
+                        1, &copyRegion);
 
-                var resourceToDst = new ImageMemoryBarrier
-                {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = AccessFlags.TransferReadBit,
-                    DstAccessMask = AccessFlags.TransferWriteBit,
-                    OldLayout = ImageLayout.TransferSrcOptimal,
-                    NewLayout = ImageLayout.TransferDstOptimal,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = resource.Image,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
-                };
-                _vk.CmdPipelineBarrier(
-                    commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit,
-                    0, 0, null, 0, null, 1, &resourceToDst);
+                    var oldTypedToSrc = new ImageMemoryBarrier
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = AccessFlags.TransferWriteBit,
+                        DstAccessMask = AccessFlags.TransferReadBit,
+                        OldLayout = ImageLayout.TransferDstOptimal,
+                        NewLayout = ImageLayout.TransferSrcOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = oldTyped,
+                        SubresourceRange = scratchRange,
+                    };
+                    _vk.CmdPipelineBarrier(
+                        commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit,
+                        0, 0, null, 0, null, 1, &oldTypedToSrc);
 
-                _vk.CmdCopyImage(
-                    commandBuffer,
-                    newTyped, ImageLayout.TransferSrcOptimal,
-                    resource.Image, ImageLayout.TransferDstOptimal,
-                    1, &copyRegion);
+                    var newTypedToDst = new ImageMemoryBarrier
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = 0,
+                        DstAccessMask = AccessFlags.TransferWriteBit,
+                        OldLayout = ImageLayout.Undefined,
+                        NewLayout = ImageLayout.TransferDstOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = newTyped,
+                        SubresourceRange = scratchRange,
+                    };
+                    _vk.CmdPipelineBarrier(
+                        commandBuffer, PipelineStageFlags.TopOfPipeBit, PipelineStageFlags.TransferBit,
+                        0, 0, null, 0, null, 1, &newTypedToDst);
 
-                var resourceToGeneral = new ImageMemoryBarrier
-                {
-                    SType = StructureType.ImageMemoryBarrier,
-                    SrcAccessMask = AccessFlags.TransferWriteBit,
-                    DstAccessMask = AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit,
-                    OldLayout = ImageLayout.TransferDstOptimal,
-                    NewLayout = ImageLayout.General,
-                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-                    Image = resource.Image,
-                    SubresourceRange = ColorSubresourceRange(0, 1),
-                };
-                _vk.CmdPipelineBarrier(
-                    commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit,
-                    0, 0, null, 0, null, 1, &resourceToGeneral);
+                    var blitRegion = new ImageBlit
+                    {
+                        SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, mipLevel, 0, 1),
+                        SrcOffsets = new ImageBlit.SrcOffsetsBuffer
+                        {
+                            Element0 = new Offset3D(0, 0, 0),
+                            Element1 = new Offset3D(
+                                checked((int)mipExtent.Width),
+                                checked((int)mipExtent.Height),
+                                checked((int)mipExtent.Depth)),
+                        },
+                        DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, mipLevel, 0, 1),
+                        DstOffsets = new ImageBlit.DstOffsetsBuffer
+                        {
+                            Element0 = new Offset3D(0, 0, 0),
+                            Element1 = new Offset3D(
+                                checked((int)mipExtent.Width),
+                                checked((int)mipExtent.Height),
+                                checked((int)mipExtent.Depth)),
+                        },
+                    };
+                    _vk.CmdBlitImage(
+                        commandBuffer,
+                        oldTyped, ImageLayout.TransferSrcOptimal,
+                        newTyped, ImageLayout.TransferDstOptimal,
+                        1, &blitRegion, Filter.Nearest);
+
+                    var newTypedToSrc = new ImageMemoryBarrier
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = AccessFlags.TransferWriteBit,
+                        DstAccessMask = AccessFlags.TransferReadBit,
+                        OldLayout = ImageLayout.TransferDstOptimal,
+                        NewLayout = ImageLayout.TransferSrcOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = newTyped,
+                        SubresourceRange = scratchRange,
+                    };
+                    _vk.CmdPipelineBarrier(
+                        commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit,
+                        0, 0, null, 0, null, 1, &newTypedToSrc);
+
+                    var resourceToDst = new ImageMemoryBarrier
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = AccessFlags.TransferReadBit,
+                        DstAccessMask = AccessFlags.TransferWriteBit,
+                        OldLayout = ImageLayout.TransferSrcOptimal,
+                        NewLayout = ImageLayout.TransferDstOptimal,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = resource.Image,
+                        SubresourceRange = resourceRange,
+                    };
+                    _vk.CmdPipelineBarrier(
+                        commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.TransferBit,
+                        0, 0, null, 0, null, 1, &resourceToDst);
+
+                    _vk.CmdCopyImage(
+                        commandBuffer,
+                        newTyped, ImageLayout.TransferSrcOptimal,
+                        resource.Image, ImageLayout.TransferDstOptimal,
+                        1, &copyRegion);
+
+                    var resourceToGeneral = new ImageMemoryBarrier
+                    {
+                        SType = StructureType.ImageMemoryBarrier,
+                        SrcAccessMask = AccessFlags.TransferWriteBit,
+                        DstAccessMask = AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit,
+                        OldLayout = ImageLayout.TransferDstOptimal,
+                        NewLayout = ImageLayout.General,
+                        SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                        Image = resource.Image,
+                        SubresourceRange = resourceRange,
+                    };
+                    _vk.CmdPipelineBarrier(
+                        commandBuffer, PipelineStageFlags.TransferBit, PipelineStageFlags.AllCommandsBit,
+                        0, 0, null, 0, null, 1, &resourceToGeneral);
+                }
 
                 Check(_vk.EndCommandBuffer(commandBuffer), "vkEndCommandBuffer(format-convert)");
                 SubmitGuestCommandBuffer(commandBuffer, [], []);
@@ -14974,7 +15024,8 @@ internal static unsafe class VulkanVideoPresenter
                         $"source_format={fromFormat} target_format={toFormat} " +
                         $"address=0x{resource.Address:X16} " +
                         "reason=bit-incompatible-view-reinterpret " +
-                        $"size={resource.Width}x{resource.Height}");
+                        $"size={resource.Width}x{resource.Height}x{resource.Depth} " +
+                        $"mips={mipLevels}");
                 }
             }
             finally
