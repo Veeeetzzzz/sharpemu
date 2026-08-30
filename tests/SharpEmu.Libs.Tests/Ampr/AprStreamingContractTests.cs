@@ -9,7 +9,7 @@ using Xunit;
 
 namespace SharpEmu.Libs.Tests.Ampr;
 
-[Collection("AmprFileRegistry")]
+[Collection(AmprStateCollection.Name)]
 public sealed class AprStreamingContractTests
 {
     [Fact]

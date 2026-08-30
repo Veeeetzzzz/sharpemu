@@ -14,6 +14,7 @@ namespace SharpEmu.Libs.Tests.Ampr;
 // picking by directory order alone mis-resolves out-of-order reads: Quake requested progs/h_ogre.mdl
 // (0x3A34 bytes) but the tracker returned bots/navigation/death32c.nav, which shares the size and
 // sits earlier in the directory, so the guest parsed NAV2 data as a brush model and aborted.
+[Collection(AmprStateCollection.Name)]
 public sealed class PakDirectoryTrackerTests
 {
     private const int EntrySize = 64;
