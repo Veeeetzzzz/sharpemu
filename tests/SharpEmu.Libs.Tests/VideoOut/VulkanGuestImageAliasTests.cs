@@ -92,6 +92,39 @@ public sealed class VulkanGuestImageAliasTests
             VulkanVideoPresenter.IsAliasableGuestImageFormat(existing, requested));
     }
 
+    [Theory]
+    [InlineData(Format.R8Srgb, Format.R8Unorm)]
+    [InlineData(Format.R8G8Srgb, Format.R8G8Unorm)]
+    [InlineData(Format.R16G16SNorm, Format.R16G16Unorm)]
+    [InlineData(Format.R8G8B8A8SNorm, Format.R8G8B8A8Unorm)]
+    [InlineData(Format.B8G8R8A8Srgb, Format.B8G8R8A8Unorm)]
+    [InlineData(Format.B8G8R8A8SNorm, Format.B8G8R8A8Unorm)]
+    [InlineData(Format.A8B8G8R8SrgbPack32, Format.A8B8G8R8UnormPack32)]
+    [InlineData(Format.E5B9G9R9UfloatPack32, Format.B10G11R11UfloatPack32)]
+    [InlineData(Format.R16G16B16A16SNorm, Format.R16G16B16A16Unorm)]
+    public void SameLayoutFormatsShareOneCompatibilityClass(
+        Format existing,
+        Format requested)
+    {
+        Assert.True(
+            VulkanVideoPresenter.IsCompatibleGuestImageViewFormat(
+                existing,
+                requested));
+    }
+
+    [Theory]
+    [InlineData(Format.R8Srgb, Format.R8Unorm)]
+    [InlineData(Format.R8G8Srgb, Format.R8G8Unorm)]
+    public void OneAndTwoChannelSrgbCounterpartsShareOneGuestImage(
+        Format existing,
+        Format requested)
+    {
+        Assert.True(
+            VulkanVideoPresenter.IsAliasableGuestImageFormat(
+                existing,
+                requested));
+    }
+
     [Fact]
     public void AliasedPairStaysWithinOneCompatibilityClass()
     {

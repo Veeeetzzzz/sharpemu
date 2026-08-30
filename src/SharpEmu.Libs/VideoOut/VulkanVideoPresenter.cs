@@ -6,6 +6,7 @@ using Silk.NET.Core.Native;
 using System.Collections.Concurrent;
 using SharpEmu.HLE;
 using SharpEmu.Libs.Agc;
+using SharpEmu.Libs.AvPlayer;
 using SharpEmu.Libs.Media;
 using SharpEmu.Libs.Gpu;
 using SharpEmu.ShaderCompiler;
@@ -706,6 +707,9 @@ internal static unsafe class VulkanVideoPresenter
     // render thread reaches the previous image, which otherwise starves
     // presentation indefinitely.
     private static readonly Queue<Presentation> _pendingGuestImagePresentations = new();
+    // Same fix as _pendingGuestImagePresentations above, for Submit()'s decoded video
+    // frames: a single "latest wins" slot dropped frames the render loop didn't poll in time.
+    private static readonly Queue<Presentation> _pendingVideoPresentations = new();
     private static readonly Dictionary<ulong, long> _guestImageWorkSequences = new();
     private static readonly Dictionary<ulong, uint> _availableGuestImages = new();
     // Write-tracker generation last uploaded for a CPU-backed guest image.
@@ -743,6 +747,16 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly bool _traceGuestWorkCompletion =
         string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GUEST_WORK_COMPLETION"),
+            "1",
+            StringComparison.Ordinal);
+    private static readonly bool _traceOrderedActionLatency =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_ORDERED_ACTION_LATENCY"),
+            "1",
+            StringComparison.Ordinal);
+    private static readonly bool _traceGlobalWritebackTiming =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_GLOBAL_WRITEBACK_TIMING"),
             "1",
             StringComparison.Ordinal);
     private static readonly HashSet<(ulong Address, uint Width, uint Height)>
@@ -975,6 +989,7 @@ internal static unsafe class VulkanVideoPresenter
         _pendingSyncGuestWorkCount = 0;
         _pendingGuestWorkBytes = 0;
         _pendingGuestImagePresentations.Clear();
+        _pendingVideoPresentations.Clear();
         _guestImageWorkSequences.Clear();
         _availableGuestImages.Clear();
         _cpuBackedUploadGenerations.Clear();
@@ -1030,7 +1045,7 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var sequence = (_latestPresentation?.Sequence ?? 0) + 1;
-            _latestPresentation = new Presentation(
+            var presentation = new Presentation(
                 bgraFrame,
                 width,
                 height,
@@ -1039,6 +1054,15 @@ internal static unsafe class VulkanVideoPresenter
                 TranslatedDraw: null,
                 RequiredGuestWorkSequence: 0,
                 IsSplash: false);
+
+            // Also dual-written to _latestPresentation as a fallback once the queue drains.
+            _pendingVideoPresentations.Enqueue(presentation);
+            while (_pendingVideoPresentations.Count > MaxPendingGuestFlipVersions)
+            {
+                _pendingVideoPresentations.Dequeue();
+            }
+
+            _latestPresentation = presentation;
             if (_thread is not null)
             {
                 return;
@@ -2620,11 +2644,25 @@ internal static unsafe class VulkanVideoPresenter
                 if (IsGuestWorkCompletedLocked(pending.RequiredGuestWorkSequence))
                 {
                     presentation = _pendingGuestImagePresentations.Dequeue();
+                    TryReplaceWithHostMovieFrame(ref presentation);
                     return true;
                 }
 
                 presentation = default;
                 return false;
+            }
+
+            // Video's RequiredGuestWorkSequence is always 0, so this never blocks like the guest-image queue can.
+            while (_pendingVideoPresentations.Count > 0 &&
+                   _pendingVideoPresentations.Peek().Sequence <= presentedSequence)
+            {
+                _pendingVideoPresentations.Dequeue();
+            }
+
+            if (_pendingVideoPresentations.Count > 0)
+            {
+                presentation = _pendingVideoPresentations.Dequeue();
+                return true;
             }
 
             if (_latestPresentation is not { } latest ||
@@ -2652,10 +2690,97 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             presentation = latest;
+            TryReplaceWithHostMovieFrame(ref presentation);
             return true;
         }
     }
 
+    /// <summary>
+    /// AvPlayer titles whose guest texture allocators reject the decoded movie
+    /// surface have no sampled image to draw, so the movie would never become
+    /// visible.  In that case the AvPlayer HLE keeps a host-decoded BGRA frame
+    /// available; substitute it for the guest image the title is flipping.
+    /// </summary>
+    private static void TryReplaceWithHostMovieFrame(ref Presentation presentation)
+    {
+        if (!TryTakeHostMovieFrame(out var pixels, out var width, out var height))
+        {
+            return;
+        }
+
+        presentation = new Presentation(
+            pixels,
+            width,
+            height,
+            presentation.Sequence,
+            GuestDrawKind.None,
+            TranslatedDraw: null,
+            presentation.RequiredGuestWorkSequence,
+            IsSplash: false);
+    }
+
+    /// <summary>
+    /// The movie is decoded on the host clock, so it must not be limited to the
+    /// title's flip rate: emulated flips are far slower than 59.94 Hz, which
+    /// would turn the intro into a slideshow.  The render loop uses this on the
+    /// ticks where the guest produced no new flip, keeping the same presented
+    /// sequence so guest presentation bookkeeping is untouched.
+    /// </summary>
+    private static bool TryTakeHostMovieOnlyPresentation(
+        long presentedSequence,
+        out Presentation presentation)
+    {
+        if (!TryTakeHostMovieFrame(out var pixels, out var width, out var height))
+        {
+            presentation = default;
+            return false;
+        }
+
+        presentation = new Presentation(
+            pixels,
+            width,
+            height,
+            presentedSequence,
+            GuestDrawKind.None,
+            TranslatedDraw: null,
+            RequiredGuestWorkSequence: 0,
+            IsSplash: false);
+        return true;
+    }
+
+    private static bool TryTakeHostMovieFrame(
+        out byte[] pixels,
+        out uint width,
+        out uint height)
+    {
+        if (!AvPlayerExports.TryGetFallbackPresentationFrame(
+                out pixels,
+                out width,
+                out height,
+                out var serial))
+        {
+            return false;
+        }
+
+        if (Interlocked.Exchange(
+                ref _tracedAvPlayerFallbackPresentationSerial,
+                serial) != serial)
+        {
+            var frameCount = Interlocked.Increment(
+                ref _avPlayerFallbackPresentationCount);
+            if (frameCount <= 4 || frameCount % 30 == 0)
+            {
+                Console.Error.WriteLine(
+                    "[VIDEOOUT][INFO] AvPlayer host fallback frame presented: " +
+                    $"frame={frameCount} serial={serial} size={width}x{height}.");
+            }
+        }
+
+        return true;
+    }
+
+    private static long _tracedAvPlayerFallbackPresentationSerial;
+    private static long _avPlayerFallbackPresentationCount;
     private static readonly HashSet<long> _tracedGuestImagePresentRejections = new();
 
 	private static bool HasPendingGuestPresentation(long presentedSequence)
@@ -5969,6 +6094,7 @@ internal static unsafe class VulkanVideoPresenter
 
         private void ExecuteOrderedGuestFlip(VulkanOrderedGuestFlip work)
         {
+            Agc.AgcExports.MarkAllSurfacesCleared();
             FlushBatchedGuestCommands();
             _guestImages.TryGetValue(work.Address, out var source);
             if (_deviceLost ||
@@ -6322,6 +6448,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 _deferredGuestImageVersionDestroys.Dequeue();
                 DestroyGuestImage(imageEntry.Image);
+                FlipProgressTracker.RecordFlip(imageEntry.Image.FlipVersion);
                 TraceVulkanShader(
                     $"vk.flip_retired version={imageEntry.Image.FlipVersion} " +
                     $"timeline={imageEntry.RetireTimeline} reason=presentation-dropped");
@@ -6347,6 +6474,7 @@ internal static unsafe class VulkanVideoPresenter
                     _frameGuestImageVersions[slot] = null;
                     _capturedGuestFlipVersions.Remove(unsubmittedVersion.FlipVersion);
                     DestroyGuestImage(unsubmittedVersion);
+                    FlipProgressTracker.RecordFlip(unsubmittedVersion.FlipVersion);
                     TraceVulkanShader(
                         $"vk.flip_retired version={unsubmittedVersion.FlipVersion} " +
                         $"frame_slot={slot} reason=frame-not-submitted");
@@ -6380,6 +6508,7 @@ internal static unsafe class VulkanVideoPresenter
                 _frameGuestImageVersions[slot] = null;
                 _capturedGuestFlipVersions.Remove(guestImageVersion.FlipVersion);
                 DestroyGuestImage(guestImageVersion);
+                FlipProgressTracker.RecordFlip(guestImageVersion.FlipVersion);
                 TraceVulkanShader(
                     $"vk.flip_retired version={guestImageVersion.FlipVersion} " +
                     $"frame_slot={slot} timeline={_frameTimelines[slot]}");
@@ -10376,7 +10505,12 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             var size = (ulong)Math.Max(guestBuffer.Length, sizeof(uint));
-            var endAddress = checked(guestBuffer.BaseAddress + size);
+            if (guestBuffer.BaseAddress > ulong.MaxValue - size)
+            {
+                return CreateTransientGlobalBufferResource(guestBuffer);
+            }
+
+            var endAddress = guestBuffer.BaseAddress + size;
             GuestBufferAllocation? allocation = null;
             foreach (var candidate in _guestBufferAllocations)
             {
@@ -10614,9 +10748,14 @@ internal static unsafe class VulkanVideoPresenter
                 }
 
                 var size = (ulong)Math.Max(buffer.Length, sizeof(uint));
+                if (buffer.BaseAddress > ulong.MaxValue - size - 3)
+                {
+                    continue;
+                }
+
                 var alignedStart = buffer.BaseAddress &
                     ~(GuestStorageBufferOffsetAlignment - 1);
-                var paddedEnd = checked(buffer.BaseAddress + size + 3) & ~3UL;
+                var paddedEnd = (buffer.BaseAddress + size + 3) & ~3UL;
                 ranges.Add((
                     alignedStart,
                     paddedEnd));
@@ -12270,6 +12409,8 @@ internal static unsafe class VulkanVideoPresenter
                     var unreadablePages = 0;
                     var fallbackWrites = 0;
                     var firstChangedOffset = -1;
+                    var scanTicks = 0L;
+                    var ioTicks = 0L;
                     allocation.DirtyRanges.RemoveAt(index);
 
                     // A writable descriptor only identifies a potential write
@@ -12508,6 +12649,16 @@ internal static unsafe class VulkanVideoPresenter
                             $"probe_nonzero={nonzero}/{probe.Length} " +
                             $"changed_head={Convert.ToHexString(head)}");
                     }
+
+                    if (_traceGlobalWritebackTiming && changedRuns > 0)
+                    {
+                        var freq = (double)System.Diagnostics.Stopwatch.Frequency;
+                        Console.Error.WriteLine(
+                            $"[LOADER][ERROR] vk.global_writeback_timing base=0x{guestAddress:X16} " +
+                            $"changed_runs={changedRuns} changed_pages={changedPages} " +
+                            $"scan_ms={(scanTicks * 1000.0 / freq).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)} " +
+                            $"io_ms={(ioTicks * 1000.0 / freq).ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}");
+                    }
                 }
             }
         }
@@ -12728,6 +12879,18 @@ internal static unsafe class VulkanVideoPresenter
                     _pendingGuestColorClears.TryRemove(work.Targets[index].Address, out _))
                 {
                     targets[index].Initialized = false;
+                }
+
+                // CMASK meta-state: if the surface's metadata says "all clear",
+                // start this pass from LoadOp.Clear and consume the state.
+                // CPU-backed targets are skipped (their guest memory contents
+                // are uploaded, not cleared) — same rule the flip-arm used.
+                if (work.Targets[index].Address != 0 &&
+                    !targets[index].IsCpuBacked &&
+                    Agc.AgcExports.IsMetaClearedForSurface(work.Targets[index].Address))
+                {
+                    targets[index].Initialized = false;
+                    Agc.AgcExports.ConsumeMetaClear(work.Targets[index].Address);
                 }
 
                 if (work.Targets[index].Address != 0 &&
@@ -12991,13 +13154,31 @@ internal static unsafe class VulkanVideoPresenter
                         &toDepthAttachment);
                 }
 
+                ClearColorValue[]? metaClearValues = null;
+                for (var ci = 0; ci < targets.Length; ci++)
+                {
+                    if (!targets[ci].Initialized &&
+                        work.Targets[ci].Address != 0)
+                    {
+                        var (cw0, cw1) = Agc.AgcExports.GetMetaClearValue(
+                            work.Targets[ci].Address);
+                        if (cw0 != 0 || cw1 != 0)
+                        {
+                            metaClearValues ??= new ClearColorValue[targets.Length];
+                            metaClearValues[ci] = UnpackMetaClearValue(
+                                work.Targets[ci].Format, cw0, cw1);
+                        }
+                    }
+                }
+
                 BeginTranslatedRenderPass(
                     renderPass,
                     framebuffer,
                     extent,
                     colorAttachmentCount: targets.Length,
                     hasDepthAttachment: depth is not null && !clearDepthSeparately,
-                    clearDepth: depth?.ClearDepth ?? 1f);
+                    clearDepth: depth?.ClearDepth ?? 1f,
+                    colorClearValues: metaClearValues);
                 RecordTranslatedDrawInPass(resources, extent);
                 _vk.CmdEndRenderPass(_commandBuffer);
 
@@ -13792,12 +13973,6 @@ internal static unsafe class VulkanVideoPresenter
                       (IsAliasableGuestImageFormat(existing.Format, format) &&
                       (!requiresStorage || existing.SupportsStorageUsage))))
                 {
-                    if (requiresStorage && !existing.SupportsStorageUsage)
-                    {
-                        throw new InvalidOperationException(
-                            $"Guest image 0x{target.Address:X16} was created without storage usage.");
-                    }
-
                     existing.IsCpuBacked = false;
                     existing.CpuContentFingerprint = 0;
                     if (existing.RenderPass.Handle == 0 &&
@@ -13934,50 +14109,52 @@ internal static unsafe class VulkanVideoPresenter
             {
                 if (requiresStorage && !retained.SupportsStorageUsage)
                 {
-                    throw new InvalidOperationException(
-                        $"Retained guest image 0x{target.Address:X16} was created without storage usage.");
+                    // Do not reuse retained image if it lacks required storage usage
+                    DestroyGuestImage(retained);
                 }
-
-                retained.IsCpuBacked = false;
-                retained.CpuContentFingerprint = 0;
-                _guestImages.Add(target.Address, retained);
-                var retainedByteCount = GetTextureByteCount(
-                    target.Format,
-                    target.Width,
-                    target.Height,
-                    depth);
-                lock (_gate)
+                else
                 {
-                    _cpuBackedUploadGenerations.Remove(target.Address);
-                    _guestImageExtents[target.Address] = (
+                    retained.IsCpuBacked = false;
+                    retained.CpuContentFingerprint = 0;
+                    _guestImages.Add(target.Address, retained);
+                    var retainedByteCount = GetTextureByteCount(
+                        target.Format,
                         target.Width,
                         target.Height,
-                        retainedByteCount);
-                }
+                        depth);
+                    lock (_gate)
+                    {
+                        _cpuBackedUploadGenerations.Remove(target.Address);
+                        _guestImageExtents[target.Address] = (
+                            target.Width,
+                            target.Height,
+                            retainedByteCount);
+                    }
 
-                // Arm the exact extent the flip/acquire sync path would read
-                // back, budgeted by bytes rather than by resolution: the old
-                // 1920x1080 cap left every 4K surface permanently
-                // un-invalidated, so a guest CPU rewrite of one was never
-                // reflected and the sample served stale bytes.
-                if (ShouldTrackGuestImageWrites(retainedByteCount))
-                {
-                    SharpEmu.HLE.GuestImageWriteTracker.Track(
-                        target.Address,
-                        retainedByteCount,
-                        CurrentGuestWorkSequenceForDiagnostics,
-                        "vulkan.render-target");
-                }
+                    // Arm the exact extent the flip/acquire sync path would read
+                    // back, budgeted by bytes rather than by resolution: the old
+                    // 1920x1080 cap left every 4K surface permanently
+                    // un-invalidated, so a guest CPU rewrite of one was never
+                    // reflected and the sample served stale bytes.
+                    if (ShouldTrackGuestImageWrites(retainedByteCount))
+                    {
+                        SharpEmu.HLE.GuestImageWriteTracker.Track(
+                            target.Address,
+                            retainedByteCount,
+                            CurrentGuestWorkSequenceForDiagnostics,
+                            "vulkan.render-target");
+                    }
 
-                if (_traceGuestImageEvents)
-                {
-                    Console.Error.WriteLine(
-                        $"[GIMG] retained addr=0x{target.Address:X} " +
-                        $"{target.Width}x{target.Height} fmt={format} " +
-                        $"initialized={retained.Initialized}");
-                }
+                    if (_traceGuestImageEvents)
+                    {
+                        Console.Error.WriteLine(
+                            $"[GIMG] retained addr=0x{target.Address:X} " +
+                            $"{target.Width}x{target.Height} fmt={format} " +
+                            $"initialized={retained.Initialized}");
+                    }
 
-                return retained;
+                    return retained;
+                }
             }
 
             var imageInfo = new ImageCreateInfo
@@ -15381,6 +15558,8 @@ internal static unsafe class VulkanVideoPresenter
             format switch
             {
                 Format.R8Unorm or
+                Format.R8SNorm or
+                Format.R8Srgb or
                 Format.R8Uint or
                 Format.R8Sint or
                 Format.R8SNorm or
@@ -15639,6 +15818,16 @@ internal static unsafe class VulkanVideoPresenter
                         $"queued_ms={(System.Diagnostics.Stopwatch.GetTimestamp() - pendingGuestWork.EnqueuedTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F3} " +
                         work.GetType().Name);
                 }
+
+                if (_traceOrderedActionLatency && work is VulkanOrderedGuestAction orderedActionForLatency)
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] vk.ordered_action_latency #{completedWork} " +
+                        $"name='{orderedActionForLatency.DebugName}' " +
+                        $"queue={pendingGuestWork.Queue.Name} " +
+                        $"queued_ms={(System.Diagnostics.Stopwatch.GetTimestamp() - pendingGuestWork.EnqueuedTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency:F3} " +
+                        $"pending={_pendingGuestWorkCount}");
+                }
                 try
                 {
 
@@ -15809,6 +15998,12 @@ internal static unsafe class VulkanVideoPresenter
             using (RenderPhaseProfile.Measure(RenderPhaseProfile.Phase.TakePresentation))
             {
                 tookPresentation = TryTakePresentation(_presentedSequence, out presentation);
+            }
+
+            if (!tookPresentation &&
+                TryTakeHostMovieOnlyPresentation(_presentedSequence, out presentation))
+            {
+                tookPresentation = true;
             }
 
             if (!tookPresentation)
@@ -16001,6 +16196,7 @@ internal static unsafe class VulkanVideoPresenter
                     ownsPresentedGuestImageVersion,
                     presentedGuestImage);
 
+                _presentedSequence = presentation.Sequence;
                 return;
             }
 
@@ -16139,11 +16335,13 @@ internal static unsafe class VulkanVideoPresenter
                 // The submitted frame still executes; RecreateSwapchainResources
                 // drains it (and every frame slot) before destroying anything.
                 RecreateSwapchainResources("vkQueuePresentKHR", presentResult);
+                _presentedSequence = presentation.Sequence;
                 return;
             }
 
             CheckSwapchainResult(presentResult, "vkQueuePresentKHR");
             recreateAfterPresent |= presentResult == Result.SuboptimalKhr;
+            RenderDocCapture.OnPresent();
             VideoOutExports.ReportPresentedFrame();
             PerfOverlay.RecordPresent();
             RenderPhaseProfile.RecordFrame();
@@ -17341,7 +17539,7 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.CmdPipelineBarrier(
                     _commandBuffer,
                     shaderStage,
-                    shaderStage,
+                    PipelineStageFlags.AllCommandsBit,
                     0,
                     0,
                     null,
@@ -17817,20 +18015,67 @@ internal static unsafe class VulkanVideoPresenter
             _vk.CmdEndRenderPass(_commandBuffer);
         }
 
+        /// <summary>
+        /// Decodes the CB CLEAR_WORD0/1 pair into a float RGBA clear value
+        /// according to the surface pixel format.  CLEAR_WORD holds the clear
+        /// colour packed in the surface's native layout, so the two 32-bit
+        /// words must be unpacked channel-by-channel; passing the raw word as
+        /// a single float channel clears to a garbage colour.
+        /// </summary>
+        private static ClearColorValue UnpackMetaClearValue(
+            uint format, uint cw0, uint cw1)
+        {
+            switch (format)
+            {
+                // Gen5 8_8_8_8 (R8G8B8A8): four UNORM bytes packed in WORD0,
+                // little-endian channel order R,G,B,A.
+                case Agc.AgcExports.Gen5TextureFormatR8G8B8A8Unorm:
+                    return new ClearColorValue(
+                        float32_0: ((cw0 >> 0) & 0xFF) / 255f,
+                        float32_1: ((cw0 >> 8) & 0xFF) / 255f,
+                        float32_2: ((cw0 >> 16) & 0xFF) / 255f,
+                        float32_3: ((cw0 >> 24) & 0xFF) / 255f);
+
+                // Gen5 16_16_16_16 float (R16G16B16A16F): R,G as halfs in
+                // WORD0 and B,A as halfs in WORD1.
+                case Agc.AgcExports.Gen5TextureFormatR16G16B16A16Float:
+                    return new ClearColorValue(
+                        float32_0: HalfToFloat((ushort)(cw0 >> 0)),
+                        float32_1: HalfToFloat((ushort)(cw0 >> 16)),
+                        float32_2: HalfToFloat((ushort)(cw1 >> 0)),
+                        float32_3: HalfToFloat((ushort)(cw1 >> 16)));
+
+                default:
+                    // Unknown format: fall back to the common 8_8_8_8 layout.
+                    return new ClearColorValue(
+                        float32_0: ((cw0 >> 0) & 0xFF) / 255f,
+                        float32_1: ((cw0 >> 8) & 0xFF) / 255f,
+                        float32_2: ((cw0 >> 16) & 0xFF) / 255f,
+                        float32_3: ((cw0 >> 24) & 0xFF) / 255f);
+            }
+        }
+
+        private static float HalfToFloat(ushort halfBits) =>
+            (float)BitConverter.UInt16BitsToHalf(halfBits);
+
         private void BeginTranslatedRenderPass(
             RenderPass renderPass,
             Framebuffer framebuffer,
             Extent2D extent,
             int colorAttachmentCount = 1,
             bool hasDepthAttachment = false,
-            float clearDepth = 1f)
+            float clearDepth = 1f,
+            ClearColorValue[]? colorClearValues = null)
         {
             colorAttachmentCount = Math.Max(colorAttachmentCount, 1);
             var clearValueCount = colorAttachmentCount + (hasDepthAttachment ? 1 : 0);
             var clearValues = stackalloc ClearValue[clearValueCount];
             for (var index = 0; index < colorAttachmentCount; index++)
             {
-                clearValues[index] = default;
+                clearValues[index] = colorClearValues is not null &&
+                    index < colorClearValues.Length
+                        ? new ClearValue { Color = colorClearValues[index] }
+                        : default;
             }
             // Reverse-Z is not assumed; clear depth to 1.0 (far) so a standard
             // LessOrEqual/Less test keeps the nearest fragment.

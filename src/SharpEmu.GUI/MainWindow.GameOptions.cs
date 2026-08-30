@@ -22,6 +22,7 @@ public partial class MainWindow
         "SHARPEMU_LOG_IO",
         "SHARPEMU_LOG_NP",
         "SHARPEMU_GUEST_IMAGE_CPU_SYNC",
+        "SHARPEMU_RENDERDOC",
     ];
 
     private readonly List<string> _gameEnvironmentPassthrough = new();
@@ -482,6 +483,8 @@ public partial class MainWindow
         ("SHARPEMU_LOG_IO", GameEnvLogIoToggle),
         ("SHARPEMU_LOG_NP", GameEnvLogNpToggle),
         ("SHARPEMU_GUEST_IMAGE_CPU_SYNC", GameEnvGuestImageCpuSyncToggle),
+        ("SHARPEMU_FORCE_SUBMIT_ORPHAN_PREAMBLES", GameEnvForceSubmitOrphanPreamblesToggle),
+        ("SHARPEMU_RENDERDOC", GameEnvRenderDocToggle),
     ];
 
     private static void SetGameOptionsOpenClass(Control control, bool active) =>
