@@ -118,6 +118,112 @@ internal static unsafe class VulkanVideoPresenter
     internal static bool IsGuestTexture3D(uint type) =>
         type == Gen5TextureType3D;
 
+    /// <summary>
+    /// Finds changed runs in one mapped writeback page. Dense pages are
+    /// represented by one full-page run; sparse pages use SIMD equality
+    /// skips before the scalar mismatch scan. The returned byte count is
+    /// the total changed-byte count represented by <paramref name="runs"/>.
+    /// </summary>
+    internal static int ScanChangedWritebackRuns(
+        ReadOnlySpan<byte> mapped,
+        ReadOnlySpan<byte> shadow,
+        int absoluteOffset,
+        List<(int Start, int Length)> runs)
+    {
+        if (mapped.Length != shadow.Length)
+        {
+            throw new ArgumentException("Mapped and shadow spans must have the same length.");
+        }
+
+        runs.Clear();
+        if (mapped.Length == 0 || mapped.SequenceEqual(shadow))
+        {
+            return 0;
+        }
+
+        const int coarseBlockSize = 128;
+        var coarseBlockCount = 0;
+        var coarseDiffBlockCount = 0;
+        for (var blockStart = 0; blockStart < mapped.Length; blockStart += coarseBlockSize)
+        {
+            var blockEnd = Math.Min(blockStart + coarseBlockSize, mapped.Length);
+            coarseBlockCount++;
+            if (!mapped.Slice(blockStart, blockEnd - blockStart).SequenceEqual(
+                    shadow.Slice(blockStart, blockEnd - blockStart)))
+            {
+                coarseDiffBlockCount++;
+            }
+        }
+
+        if (coarseBlockCount > 0 && coarseDiffBlockCount * 4 >= coarseBlockCount)
+        {
+            runs.Add((absoluteOffset, mapped.Length));
+            return mapped.Length;
+        }
+
+        var changedBytes = 0;
+        var cursor = 0;
+        while (cursor < mapped.Length)
+        {
+            cursor = SkipEqualBytes(mapped, shadow, cursor, mapped.Length);
+            if (cursor == mapped.Length)
+            {
+                break;
+            }
+
+            var runStart = cursor;
+            cursor = SkipDifferentBytes(mapped, shadow, cursor, mapped.Length);
+            var runLength = cursor - runStart;
+            runs.Add((absoluteOffset + runStart, runLength));
+            changedBytes += runLength;
+        }
+
+        return changedBytes;
+    }
+
+    private static int SkipEqualBytes(
+        ReadOnlySpan<byte> first,
+        ReadOnlySpan<byte> second,
+        int start,
+        int end)
+    {
+        var cursor = start;
+        var vectorSize = Vector<byte>.Count;
+        while (cursor + vectorSize <= end)
+        {
+            var left = new Vector<byte>(first.Slice(cursor, vectorSize));
+            var right = new Vector<byte>(second.Slice(cursor, vectorSize));
+            if (left != right)
+            {
+                break;
+            }
+
+            cursor += vectorSize;
+        }
+
+        while (cursor < end && first[cursor] == second[cursor])
+        {
+            cursor++;
+        }
+
+        return cursor;
+    }
+
+    private static int SkipDifferentBytes(
+        ReadOnlySpan<byte> first,
+        ReadOnlySpan<byte> second,
+        int start,
+        int end)
+    {
+        var cursor = start;
+        while (cursor < end && first[cursor] != second[cursor])
+        {
+            cursor++;
+        }
+
+        return cursor;
+    }
+
     internal static uint GetGuestTextureDepth(uint type, uint depth) =>
         IsGuestTexture3D(type) ? Math.Max(depth, 1u) : 1u;
 
@@ -12236,59 +12342,19 @@ internal static unsafe class VulkanVideoPresenter
                             // merge against ordinary cached memory.
                             var mappedPage = mappedPageBuffer.AsSpan(0, pageLength);
                             mappedPageSource.CopyTo(mappedPage);
-                            pageRuns.Clear();
                             var scanStartTicks = _traceGlobalWritebackTiming
                                 ? System.Diagnostics.Stopwatch.GetTimestamp()
                                 : 0L;
-
-                            const int coarseBlockSize = 128;
-                            var coarseBlockCount = 0;
-                            var coarseDiffBlockCount = 0;
-                            for (var blockStart = 0; blockStart < pageLength; blockStart += coarseBlockSize)
+                            var pageChangedBytes = ScanChangedWritebackRuns(
+                                mappedPage,
+                                shadowPage,
+                                pageStart,
+                                pageRuns);
+                            changedRuns += pageRuns.Count;
+                            changedBytes += (ulong)pageChangedBytes;
+                            if (pageRuns.Count > 0 && firstChangedOffset < 0)
                             {
-                                var blockEnd = Math.Min(blockStart + coarseBlockSize, pageLength);
-                                coarseBlockCount++;
-                                if (!mappedPage.Slice(blockStart, blockEnd - blockStart).SequenceEqual(
-                                        shadowPage.Slice(blockStart, blockEnd - blockStart)))
-                                {
-                                    coarseDiffBlockCount++;
-                                }
-                            }
-
-                            if (coarseBlockCount > 0 && coarseDiffBlockCount * 4 >= coarseBlockCount)
-                            {
-                                pageRuns.Add((pageStart, pageLength));
-                                changedRuns++;
-                                changedBytes += (ulong)pageLength;
-                                if (firstChangedOffset < 0)
-                                {
-                                    firstChangedOffset = pageStart;
-                                }
-                            }
-                            else if (coarseDiffBlockCount > 0)
-                            {
-                                var cursor = 0;
-                                while (cursor < pageLength)
-                                {
-                                    cursor = SkipEqualBytes(mappedPage, shadowPage, cursor, pageLength);
-
-                                    if (cursor == pageLength)
-                                    {
-                                        break;
-                                    }
-
-                                    var runStart = cursor;
-                                    cursor = SkipDifferentBytes(mappedPage, shadowPage, cursor, pageLength);
-
-                                    var runLength = cursor - runStart;
-                                    pageRuns.Add((pageStart + runStart, runLength));
-                                    changedRuns++;
-                                    changedBytes += (ulong)runLength;
-                                    if (firstChangedOffset < 0)
-                                    {
-                                        firstChangedOffset = pageStart + runStart;
-                                    }
-                                }
+                                firstChangedOffset = pageRuns[0].Start;
                             }
 
                             if (_traceGlobalWritebackTiming)
@@ -12508,49 +12574,6 @@ internal static unsafe class VulkanVideoPresenter
                     }
                 }
             }
-        }
-
-        private static int SkipEqualBytes(
-            ReadOnlySpan<byte> a,
-            ReadOnlySpan<byte> b,
-            int start,
-            int end)
-        {
-            var cursor = start;
-            var vectorSize = System.Numerics.Vector<byte>.Count;
-            while (cursor + vectorSize <= end)
-            {
-                var va = new System.Numerics.Vector<byte>(a.Slice(cursor, vectorSize));
-                var vb = new System.Numerics.Vector<byte>(b.Slice(cursor, vectorSize));
-                if (va != vb)
-                {
-                    break;
-                }
-
-                cursor += vectorSize;
-            }
-
-            while (cursor < end && a[cursor] == b[cursor])
-            {
-                cursor++;
-            }
-
-            return cursor;
-        }
-
-        private static int SkipDifferentBytes(
-            ReadOnlySpan<byte> a,
-            ReadOnlySpan<byte> b,
-            int start,
-            int end)
-        {
-            var cursor = start;
-            while (cursor < end && a[cursor] != b[cursor])
-            {
-                cursor++;
-            }
-
-            return cursor;
         }
 
         private void RecordChunkedComputeDispatch(
