@@ -14750,11 +14750,33 @@ internal static unsafe class VulkanVideoPresenter
             Format fromFormat,
             Format toFormat)
         {
-            var (oldTyped, oldMemory) = CreateTransferScratchImage(fromFormat, resource.Width, resource.Height);
-            var (newTyped, newMemory) = CreateTransferScratchImage(toFormat, resource.Width, resource.Height);
+            if (!resource.Initialized ||
+                resource.Width == 0 ||
+                resource.Height == 0)
+            {
+                return;
+            }
+
+            // A format conversion reads the current image contents. Finish any
+            // open render pass and prior queue submissions first; otherwise the
+            // conversion command could race the draw that produced the pixels.
+            FlushBatchedGuestCommands();
+            WaitForAllGuestSubmissions();
+
+            var (oldTyped, oldMemory) = CreateTransferScratchImage(
+                fromFormat,
+                resource.Width,
+                resource.Height);
+            var (newTyped, newMemory) = CreateTransferScratchImage(
+                toFormat,
+                resource.Width,
+                resource.Height);
+            CommandBuffer commandBuffer = default;
+            var submitted = false;
+            var completed = false;
             try
             {
-                var commandBuffer = AllocateGuestCommandBuffer();
+                commandBuffer = AllocateGuestCommandBuffer();
                 var beginInfo = new CommandBufferBeginInfo
                 {
                     SType = StructureType.CommandBufferBeginInfo,
@@ -14919,6 +14941,14 @@ internal static unsafe class VulkanVideoPresenter
 
                 Check(_vk.EndCommandBuffer(commandBuffer), "vkEndCommandBuffer(format-convert)");
                 SubmitGuestCommandBuffer(commandBuffer, [], []);
+                submitted = true;
+
+                // The scratch images are not placed in the normal retirement
+                // list, so wait for this conversion submission before freeing
+                // them. Destroying them immediately after QueueSubmit would
+                // let the GPU dereference freed VkImage memory.
+                WaitForAllGuestSubmissions();
+                completed = true;
 
                 if (_traceGuestImageEvents)
                 {
@@ -14932,17 +14962,32 @@ internal static unsafe class VulkanVideoPresenter
             }
             finally
             {
-                _vk.DestroyImage(_device, oldTyped, null);
-                _vk.FreeMemory(_device, oldMemory, null);
-                _vk.DestroyImage(_device, newTyped, null);
-                _vk.FreeMemory(_device, newMemory, null);
+                if (!submitted && commandBuffer.Handle != 0)
+                {
+                    ReleaseGuestCommandBuffer(commandBuffer);
+                }
+
+                // On a device-loss exception the queue may still own these
+                // objects; teardown will reclaim them. Avoid a use-after-free
+                // if the wait above did not complete.
+                if (completed || !submitted)
+                {
+                    _vk.DestroyImage(_device, oldTyped, null);
+                    _vk.FreeMemory(_device, oldMemory, null);
+                    _vk.DestroyImage(_device, newTyped, null);
+                    _vk.FreeMemory(_device, newMemory, null);
+                }
             }
         }
 
-        private static readonly bool _realFormatConversionEnabled = string.Equals(
-            Environment.GetEnvironmentVariable("SHARPEMU_ENABLE_REAL_FORMAT_CONVERSION"),
-            "1",
-            StringComparison.Ordinal);
+        // The conversion is cheap compared with recreating a render target and
+        // losing its contents. It can be disabled for troubleshooting without
+        // changing the view-compatibility policy.
+        private static readonly bool _realFormatConversionEnabled =
+            !string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_REAL_FORMAT_CONVERSION"),
+                "1",
+                StringComparison.Ordinal);
 
         private void ReinterpretGuestImageFormat(
             GuestImageResource resource,
