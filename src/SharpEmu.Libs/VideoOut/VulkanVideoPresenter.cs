@@ -224,6 +224,23 @@ internal static unsafe class VulkanVideoPresenter
         return cursor;
     }
 
+    /// <summary>
+    /// Decides whether a render tick that already completed guest work may
+    /// wait briefly for the producer to enqueue its dependent work. The wait
+    /// is bounded by both the per-tick follow-up budget and the normal render
+    /// budget; a tick that has not completed any work never parks.
+    /// </summary>
+    internal static bool ShouldWaitForGuestWorkFollowup(
+        int completedWork,
+        int waitMilliseconds,
+        long nowTicks,
+        long followupDeadline,
+        long renderDeadline) =>
+        completedWork > 0 &&
+        waitMilliseconds > 0 &&
+        nowTicks < followupDeadline &&
+        nowTicks < renderDeadline;
+
     internal static uint GetGuestTextureDepth(uint type, uint depth) =>
         IsGuestTexture3D(type) ? Math.Max(depth, 1u) : 1u;
 
@@ -15536,10 +15553,12 @@ internal static unsafe class VulkanVideoPresenter
                 if (!tookGuestWork)
                 {
                     var nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-                    if (completedWork == 0 ||
-                        _guestWorkFollowupWaitMs <= 0 ||
-                        nowTicks >= followupDeadline ||
-                        nowTicks >= renderWorkDeadline ||
+                    if (!ShouldWaitForGuestWorkFollowup(
+                            completedWork,
+                            _guestWorkFollowupWaitMs,
+                            nowTicks,
+                            followupDeadline,
+                            renderWorkDeadline) ||
                         !WaitForFollowupGuestWork(_guestWorkFollowupWaitMs))
                     {
                         break;
