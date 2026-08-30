@@ -14,6 +14,5 @@ before they reach their normal runtime path:
 
 Registering these stubs is important even when their backing services are not
 implemented: an unresolved NID can leave a title in an import retry loop before
-the graphics path is reached. Contract tests cover the return values and guest
-memory error behavior, while the export source generator validates the names
-against the platform symbol catalog during the build.
+the graphics path is reached. Contract tests cover the registry-facing return
+values and the guest-memory error behavior.

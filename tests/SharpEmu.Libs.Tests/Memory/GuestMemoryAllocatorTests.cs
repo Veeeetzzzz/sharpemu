@@ -115,7 +115,7 @@ public sealed class GuestMemoryAllocatorTests
     }
 
     [Fact]
-    public void AdjacentFixedGuestPageMappingsShareAHostGranule()
+    public void AdjacentFixedGuestPageMappingsShareAHostGranuleOnWindows()
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -125,7 +125,9 @@ public sealed class GuestMemoryAllocatorTests
         using var memory = new PhysicalVirtualMemory(new GranularityAwareHostMemory());
         const ulong baseAddress = 0x0000008001600000;
 
-        Assert.Equal(baseAddress, memory.AllocateAt(baseAddress, 0x4000, executable: false, allowAlternative: false));
+        Assert.Equal(
+            baseAddress,
+            memory.AllocateAt(baseAddress, 0x4000, executable: false, allowAlternative: false));
         Assert.Equal(
             baseAddress + 0x4000,
             memory.AllocateAt(baseAddress + 0x4000, 0x4000, executable: false, allowAlternative: false));
@@ -137,7 +139,7 @@ public sealed class GuestMemoryAllocatorTests
     }
 
     [Fact]
-    public void TryBackFixedRangeSharesAHostGranuleAcrossCallsOnWindows()
+    public void TryBackFixedRangeSharesAHostGranuleAcrossWindowsCalls()
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -237,6 +239,154 @@ public sealed class GuestMemoryAllocatorTests
 
         Assert.False(memory.TryBackFixedRange(rangeBase, rangeSize, executable: false));
         Assert.Empty(host.AllocationCalls);
+    }
+
+    private sealed class GranularityAwareHostMemory : IHostMemory
+    {
+        private const ulong Granularity = 0x10000;
+        private const ulong Page = 0x1000;
+
+        private readonly SortedDictionary<ulong, (ulong Size, SortedSet<ulong> CommittedPages)> _allocations = new();
+
+        public ulong Allocate(ulong desiredAddress, ulong size, HostPageProtection protection)
+        {
+            var reservedBase = Reserve(desiredAddress, size, protection);
+            if (reservedBase != 0)
+            {
+                Commit(desiredAddress, size, protection);
+            }
+
+            return reservedBase;
+        }
+
+        public ulong Reserve(ulong desiredAddress, ulong size, HostPageProtection protection)
+        {
+            if (desiredAddress == 0)
+            {
+                return 0;
+            }
+
+            var allocationBase = AlignDown(desiredAddress, Granularity);
+            var end = AlignUp(desiredAddress + size, Page);
+            foreach (var (existingBase, existing) in _allocations)
+            {
+                if (allocationBase < existingBase + existing.Size && existingBase < end)
+                {
+                    return 0;
+                }
+            }
+
+            _allocations[allocationBase] = (end - allocationBase, new SortedSet<ulong>());
+            return allocationBase;
+        }
+
+        public bool Commit(ulong address, ulong size, HostPageProtection protection)
+        {
+            var start = AlignDown(address, Page);
+            var end = AlignUp(address + size, Page);
+            if (!TryFindAllocation(start, out var allocationBase, out var allocation) ||
+                end > allocationBase + allocation.Size)
+            {
+                return false;
+            }
+
+            for (var page = start; page < end; page += Page)
+            {
+                allocation.CommittedPages.Add(page);
+            }
+
+            return true;
+        }
+
+        public bool Free(ulong address) => _allocations.Remove(address);
+
+        public bool Protect(ulong address, ulong size, HostPageProtection protection, out uint rawOldProtection)
+        {
+            rawOldProtection = 0;
+            return true;
+        }
+
+        public bool ProtectRaw(ulong address, ulong size, uint rawProtection, out uint rawOldProtection)
+        {
+            rawOldProtection = 0;
+            return true;
+        }
+
+        public bool Query(ulong address, out HostRegionInfo info)
+        {
+            var page = AlignDown(address, Page);
+            if (TryFindAllocation(page, out var allocationBase, out var allocation))
+            {
+                var committed = allocation.CommittedPages.Contains(page);
+                var runEnd = page + Page;
+                while (runEnd < allocationBase + allocation.Size &&
+                       allocation.CommittedPages.Contains(runEnd) == committed)
+                {
+                    runEnd += Page;
+                }
+
+                info = new HostRegionInfo(
+                    page,
+                    allocationBase,
+                    runEnd - page,
+                    committed ? HostRegionState.Committed : HostRegionState.Reserved,
+                    RawState: 0,
+                    committed ? HostPageProtection.ReadWrite : HostPageProtection.NoAccess,
+                    RawProtection: 0,
+                    RawAllocationProtection: 0);
+                return true;
+            }
+
+            var freeEnd = ulong.MaxValue;
+            foreach (var existingBase in _allocations.Keys)
+            {
+                if (existingBase > page)
+                {
+                    freeEnd = existingBase;
+                    break;
+                }
+            }
+
+            info = new HostRegionInfo(
+                page,
+                AllocationBase: 0,
+                freeEnd - page,
+                HostRegionState.Free,
+                RawState: 0,
+                HostPageProtection.NoAccess,
+                RawProtection: 0,
+                RawAllocationProtection: 0);
+            return true;
+        }
+
+        public void FlushInstructionCache(ulong address, ulong size)
+        {
+        }
+
+        private bool TryFindAllocation(
+            ulong address,
+            out ulong allocationBase,
+            out (ulong Size, SortedSet<ulong> CommittedPages) allocation)
+        {
+            foreach (var (existingBase, existing) in _allocations)
+            {
+                if (address >= existingBase && address < existingBase + existing.Size)
+                {
+                    allocationBase = existingBase;
+                    allocation = existing;
+                    return true;
+                }
+            }
+
+            allocationBase = 0;
+            allocation = default;
+            return false;
+        }
+
+        private static ulong AlignDown(ulong value, ulong alignment) => value & ~(alignment - 1);
+
+        private static ulong AlignUp(ulong value, ulong alignment) =>
+            (value + alignment - 1) & ~(alignment - 1);
     }
 
     private sealed class PartialOverlapHostMemory : IHostMemory, IDisposable
@@ -576,154 +726,6 @@ public sealed class GuestMemoryAllocatorTests
         public void Dispose()
         {
         }
-    }
-
-    private sealed class GranularityAwareHostMemory : IHostMemory
-    {
-        private const ulong Granularity = 0x10000;
-        private const ulong Page = 0x1000;
-
-        private readonly SortedDictionary<ulong, (ulong Size, SortedSet<ulong> CommittedPages)> _allocations = new();
-
-        public ulong Allocate(ulong desiredAddress, ulong size, HostPageProtection protection)
-        {
-            var reservedBase = Reserve(desiredAddress, size, protection);
-            if (reservedBase != 0)
-            {
-                var start = desiredAddress == 0 ? reservedBase : AlignDown(desiredAddress, Page);
-                Commit(start, size, protection);
-            }
-
-            return reservedBase;
-        }
-
-        public ulong Reserve(ulong desiredAddress, ulong size, HostPageProtection protection)
-        {
-            if (desiredAddress == 0)
-            {
-                return 0;
-            }
-
-            var allocationBase = AlignDown(desiredAddress, Granularity);
-            var end = AlignUp(desiredAddress + size, Page);
-            foreach (var (existingBase, existing) in _allocations)
-            {
-                if (allocationBase < existingBase + existing.Size && existingBase < end)
-                {
-                    return 0;
-                }
-            }
-
-            _allocations[allocationBase] = (end - allocationBase, new SortedSet<ulong>());
-            return allocationBase;
-        }
-
-        public bool Commit(ulong address, ulong size, HostPageProtection protection)
-        {
-            var start = AlignDown(address, Page);
-            var end = AlignUp(address + size, Page);
-            if (!TryFindAllocation(start, out var allocationBase, out var allocation) ||
-                end > allocationBase + allocation.Size)
-            {
-                return false;
-            }
-
-            for (var page = start; page < end; page += Page)
-            {
-                allocation.CommittedPages.Add(page);
-            }
-
-            return true;
-        }
-
-        public bool Free(ulong address) => _allocations.Remove(address);
-
-        public bool Protect(ulong address, ulong size, HostPageProtection protection, out uint rawOldProtection)
-        {
-            rawOldProtection = 0;
-            return true;
-        }
-
-        public bool ProtectRaw(ulong address, ulong size, uint rawProtection, out uint rawOldProtection)
-        {
-            rawOldProtection = 0;
-            return true;
-        }
-
-        public bool Query(ulong address, out HostRegionInfo info)
-        {
-            var page = AlignDown(address, Page);
-            if (TryFindAllocation(page, out var allocationBase, out var allocation))
-            {
-                var committed = allocation.CommittedPages.Contains(page);
-                var runEnd = page + Page;
-                while (runEnd < allocationBase + allocation.Size &&
-                       allocation.CommittedPages.Contains(runEnd) == committed)
-                {
-                    runEnd += Page;
-                }
-
-                info = new HostRegionInfo(
-                    page,
-                    allocationBase,
-                    runEnd - page,
-                    committed ? HostRegionState.Committed : HostRegionState.Reserved,
-                    0,
-                    committed ? HostPageProtection.ReadWrite : HostPageProtection.NoAccess,
-                    0,
-                    0);
-                return true;
-            }
-
-            var freeEnd = ulong.MaxValue;
-            foreach (var existingBase in _allocations.Keys)
-            {
-                if (existingBase > page)
-                {
-                    freeEnd = existingBase;
-                    break;
-                }
-            }
-
-            info = new HostRegionInfo(
-                page,
-                0,
-                freeEnd - page,
-                HostRegionState.Free,
-                0,
-                HostPageProtection.NoAccess,
-                0,
-                0);
-            return true;
-        }
-
-        public void FlushInstructionCache(ulong address, ulong size)
-        {
-        }
-
-        private bool TryFindAllocation(
-            ulong address,
-            out ulong allocationBase,
-            out (ulong Size, SortedSet<ulong> CommittedPages) allocation)
-        {
-            foreach (var (existingBase, existing) in _allocations)
-            {
-                if (address >= existingBase && address < existingBase + existing.Size)
-                {
-                    allocationBase = existingBase;
-                    allocation = existing;
-                    return true;
-                }
-            }
-
-            allocationBase = 0;
-            allocation = default;
-            return false;
-        }
-
-        private static ulong AlignDown(ulong value, ulong alignment) => value & ~(alignment - 1);
-
-        private static ulong AlignUp(ulong value, ulong alignment) => (value + alignment - 1) & ~(alignment - 1);
     }
 
     private sealed class LazyHostMemory(ulong address) : IHostMemory, IDisposable

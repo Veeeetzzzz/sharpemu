@@ -6,8 +6,6 @@ using Xunit;
 
 namespace SharpEmu.Libs.Tests.Ampr;
 
-// AmprFileRegistry is process-global static state, so the classes that index
-// or clear it must not run concurrently with each other.
 [Collection(AmprStateCollection.Name)]
 public class AmprFileRegistryTests
 {

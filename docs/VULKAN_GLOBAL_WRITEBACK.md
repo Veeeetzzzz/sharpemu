@@ -13,10 +13,8 @@ The comparison is deliberately two-tiered:
   runs.
 
 When a sparse page has more than 64 runs, the writeback overlays the span from
-the first to last run as one GPU-owned region before a single guest-page write.
-Pages below that threshold overlay only the exact changed runs onto the live
-guest page, while the threshold bounds bookkeeping for heavily fragmented GPU
-output.
+the first to last run in one guest-page write. The gaps still contain the shadow
+bytes, so the preceding live-page read preserves their current CPU contents.
 Unreadable pages retain the existing small-gap coalescing and exact-run
 fallback, because no full-page merge is safe without the live guest bytes.
 

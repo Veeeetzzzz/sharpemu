@@ -114,6 +114,58 @@ if (args.Length >= 1 && string.Equals(args[0], "--inspect", StringComparison.Ord
         0xD56C0005, 0x00020501, // v_mul_hi_i32 v5, v1, v2
         0xBF810000,             // s_endpgm
     ]),
+    ("vop1-gfx10", true, [
+        0x7E0A7301, // v_ffbh_u32 v5, v1
+        0x7E0C7701, // v_ffbh_i32 v6, v1
+        0x7E0EA101, // v_cvt_f16_u16 v7, v1
+        0x7E10A301, // v_cvt_f16_i16 v8, v1
+        0x7E12A501, // v_cvt_u16_f16 v9, v1
+        0x7E14A701, // v_cvt_i16_f16 v10, v1
+        0x7E16A901, // v_rcp_f16 v11, v1
+        0x7E18AB01, // v_sqrt_f16 v12, v1
+        0x7E1AAD01, // v_rsq_f16 v13, v1
+        0x7E1CAF01, // v_log_f16 v14, v1
+        0x7E1EB101, // v_exp_f16 v15, v1
+        0x7E20B301, // v_frexp_mant_f16 v16, v1
+        0x7E22B501, // v_frexp_exp_i16_f16 v17, v1
+        0x7E24B701, // v_floor_f16 v18, v1
+        0x7E26B901, // v_ceil_f16 v19, v1
+        0x7E28BB01, // v_trunc_f16 v20, v1
+        0x7E2ABD01, // v_rndne_f16 v21, v1
+        0x7E2CBF01, // v_fract_f16 v22, v1
+        0x7E2EC101, // v_sin_f16 v23, v1
+        0x7E30C301, // v_cos_f16 v24, v1
+        0x7E32C501, // v_sat_pk_u8_i16 v25, v1
+        0x7E34C701, // v_cvt_norm_i16_f16 v26, v1
+        0x7E36C901, // v_cvt_norm_u16_f16 v27, v1
+        0x7E003600, // v_pipeflush
+        0x7E008200, // v_clrexcp
+        0xBF810000, // s_endpgm
+    ]),
+    ("frexp-vop1", true, [
+        0x7E0A7F01, // v_frexp_exp_i32_f32 v5, v1
+        0x7E0A8101, // v_frexp_mant_f32 v5, v1
+        0x7E0A7901, // v_frexp_exp_i32_f64 v5, v[1:2]
+        0x7E0A7B01, // v_frexp_mant_f64 v[5:6], v[1:2]
+        0xBF810000, // s_endpgm
+    ]),
+    ("f64-conversions-vop1", true, [
+        0x7E0A0701, // v_cvt_i32_f64 v5, v[1:2]
+        0x7E0A0901, // v_cvt_f64_i32 v[5:6], v1
+        0x7E0A1F01, // v_cvt_f32_f64 v5, v[1:2]
+        0x7E0A2101, // v_cvt_f64_f32 v[5:6], v1
+        0x7E0A2B01, // v_cvt_u32_f64 v5, v[1:2]
+        0x7E0A2D01, // v_cvt_f64_u32 v[5:6], v1
+        0xBF810000, // s_endpgm
+    ]),
+    ("f64-round-vop1", true, [
+        0x7E0A2F01, // v_trunc_f64 v[5:6], v[1:2]
+        0x7E0A3101, // v_ceil_f64 v[5:6], v[1:2]
+        0x7E0A3301, // v_rndne_f64 v[5:6], v[1:2]
+        0x7E0A3501, // v_floor_f64 v[5:6], v[1:2]
+        0x7E0A7D01, // v_fract_f64 v[5:6], v[1:2]
+        0xBF810000, // s_endpgm
+    ]),
     // Packed f16 (VOP3P) arithmetic, including the fused multiply-add. The
     // constants pin the double-rounding regression from the VOP3P first slice:
     // fma(0x4100, 0x7522, 0x04EA) must round once to 0x7A6B (an f32
@@ -193,6 +245,115 @@ if (args.Length >= 1 && string.Equals(args[0], "--inspect", StringComparison.Ord
     ("sopp-hints", true, [
         0xBFA10001,             // s_clause 0x1
         0xBFA30000,             // s_waitcnt_depctr 0x0
+        0xBF810000,             // s_endpgm
+    ]),
+    ("align", true, [
+        0xD14E0003, 0x040A0300, // v_alignbit_b32 v3, v0, v1, v2
+        0xD14F0004, 0x040A0300, // v_alignbyte_b32 v4, v0, v1, v2
+        0xD3440005, 0x040A0300, // v_perm_b32 v5, v0, v1, v2
+        0xD3450006, 0x040A0300, // v_xad_u32 v6, v0, v1, v2
+        0xBF810000,             // s_endpgm
+    ]),
+    ("scalar-half-vop3", true, [
+        0xD34B0003, 0x040A0300, // v_fma_f16 v3, v0.lo, v1.lo, v2.lo
+        0xD3510004, 0x040A0300, // v_min3_f16 v4, v0.lo, v1.lo, v2.lo
+        0xD3520005, 0x040A0300, // v_min3_i16 v5, v0.lo, v1.lo, v2.lo
+        0xD3530006, 0x040A0300, // v_min3_u16 v6, v0.lo, v1.lo, v2.lo
+        0xD3540007, 0x040A0300, // v_max3_f16 v7, v0.lo, v1.lo, v2.lo
+        0xD3550008, 0x040A0300, // v_max3_i16 v8, v0.lo, v1.lo, v2.lo
+        0xD3560009, 0x040A0300, // v_max3_u16 v9, v0.lo, v1.lo, v2.lo
+        0xD357000A, 0x040A0300, // v_med3_f16 v10, v0.lo, v1.lo, v2.lo
+        0xD358000B, 0x040A0300, // v_med3_i16 v11, v0.lo, v1.lo, v2.lo
+        0xD359780C, 0x040A0300, // v_med3_u16 v12.hi, v0.hi, v1.hi, v2.hi
+        0xBF810000,             // s_endpgm
+    ]),
+    ("compare-widths", true, [
+        0x7D920501,             // v_cmp_lt_f16 vcc, v1, v2
+        0x7D120501,             // v_cmp_lt_i16 vcc, v1, v2
+        0x7D520501,             // v_cmp_lt_u16 vcc, v1, v2
+        0x7C420501,             // v_cmp_lt_f64 vcc, v[1:2], v[2:3]
+        0xD4D9007E, 0x02020501, // v_cmpx_lt_f16_e64 v1, v2
+        0xBF810000,             // s_endpgm
+    ]),
+    ("integer16-vop3", true, [
+        0xD7030005, 0x02020501, // v_add_nc_u16 v5, v1, v2
+        0xD7040005, 0x02020501, // v_sub_nc_u16 v5, v1, v2
+        0xD7058005, 0x02020501, // v_mul_lo_u16 v5, v1, v2 clamp
+        0xD7070005, 0x02020501, // v_lshrrev_b16 v5, v1, v2
+        0xD7080005, 0x02020501, // v_ashrrev_i16 v5, v1, v2
+        0xD7090005, 0x02020501, // v_max_u16 v5, v1, v2
+        0xD70A0005, 0x02020501, // v_max_i16 v5, v1, v2
+        0xD70B0005, 0x02020501, // v_min_u16 v5, v1, v2
+        0xD70C0005, 0x02020501, // v_min_i16 v5, v1, v2
+        0xD70D8005, 0x02020501, // v_add_nc_i16 v5, v1, v2 clamp
+        0xD70E0005, 0x02020501, // v_sub_nc_i16 v5, v1, v2
+        0xD7110005, 0x02020501, // v_pack_b32_f16 v5, v1, v2
+        0xD7120005, 0x02020501, // v_cvt_pknorm_i16_f16 v5, v1, v2
+        0xD7130005, 0x02020501, // v_cvt_pknorm_u16_f16 v5, v1, v2
+        0xD7147805, 0x02020501, // v_lshlrev_b16 v5.hi, v1.hi, v2.hi
+        0xD7408005, 0x040E0501, // v_mad_u16 v5, v1, v2, v3 clamp
+        0xD75E8005, 0x040E0501, // v_mad_i16 v5, v1, v2, v3 clamp
+        0xD7730005, 0x040E0501, // v_mad_u32_u16 v5, v1, v2, v3
+        0xD7750005, 0x040E0501, // v_mad_i32_i16 v5, v1, v2, v3
+        0xD75F8005, 0x040E0501, // v_div_fixup_f16 v5, v1, v2, v3 clamp
+        0xBF810000,             // s_endpgm
+    ]),
+    ("packed-integer-vop3p", true, [
+        0xCC004005, 0x1C0A0300, // v_pk_mad_i16 v5, v0, v1, v2
+        0xCC014006, 0x1C0A0300, // v_pk_mul_lo_u16 v6, v0, v1
+        0xCC024007, 0x1C0A0300, // v_pk_add_i16 v7, v0, v1
+        0xCC034008, 0x1C0A0300, // v_pk_sub_i16 v8, v0, v1
+        0xCC044009, 0x1C0A0300, // v_pk_lshlrev_b16 v9, v0, v1
+        0xCC05400A, 0x1C0A0300, // v_pk_lshrrev_b16 v10, v0, v1
+        0xCC06400B, 0x1C0A0300, // v_pk_ashrrev_i16 v11, v0, v1
+        0xCC07400C, 0x1C0A0300, // v_pk_max_i16 v12, v0, v1
+        0xCC08400D, 0x1C0A0300, // v_pk_min_i16 v13, v0, v1
+        0xCC09400E, 0x1C0A0300, // v_pk_mad_u16 v14, v0, v1, v2
+        0xCC0A400F, 0x1C0A0300, // v_pk_add_u16 v15, v0, v1
+        0xCC0B4010, 0x1C0A0300, // v_pk_sub_u16 v16, v0, v1
+        0xCC0C4011, 0x1C0A0300, // v_pk_max_u16 v17, v0, v1
+        0xCC0D4012, 0x1C0A0300, // v_pk_min_u16 v18, v0, v1
+        0xCC00C013, 0x040A0300, // asymmetric high select + clamp
+        0xCC13CD1A, 0xA40A0300, // v_dot2_f32_f16 v26, abs/neg src2, clamp
+        0xCC14C014, 0x040A0300, // v_dot2_i32_i16 v20, v0, v1, v2 clamp
+        0xCC15C015, 0x040A0300, // v_dot2_u32_u16 v21, v0, v1, v2 clamp
+        0xCC16C016, 0x040A0300, // v_dot4_i32_i8 v22, v0, v1, v2 clamp
+        0xCC17C017, 0x040A0300, // v_dot4_u32_u8 v23, v0, v1, v2 clamp
+        0xCC18C018, 0x040A0300, // v_dot8_i32_i4 v24, v0, v1, v2 clamp
+        0xCC19C019, 0x040A0300, // v_dot8_u32_u4 v25, v0, v1, v2 clamp
+        0xBF810000,             // s_endpgm
+    ]),
+    // Common LDS load/store widths. Kept compute-only below because SPIR-V
+    // Workgroup storage is not legal in vertex execution models.
+    ("lds-common", true, [
+        0xD8080003, 0x00000100, // ds_rsub_u32 v0, v1 offset:3
+        0xD8300003, 0x00020100, // ds_mskor_b32 v0, v1, v2 offset:3
+        0xD8B00003, 0x0F020100, // ds_mskor_rtn_b32 v15, v0, v1, v2 offset:3
+        0xD80C0003, 0x00000100, // ds_inc_u32 v0, v1 offset:3
+        0xD8900003, 0x0E000100, // ds_dec_rtn_u32 v14, v0, v1 offset:3
+        0xD8500000, 0x00000000, // ds_nop
+        0xD8780003, 0x00000100, // ds_write_b8 v0, v1 offset:3
+        0xD87C0003, 0x00000100, // ds_write_b16 v0, v1 offset:3
+        0xD8E40003, 0x10000000, // ds_read_i8 v16, v0 offset:3
+        0xD8E80003, 0x11000000, // ds_read_u8 v17, v0 offset:3
+        0xD8EC0003, 0x12000000, // ds_read_i16 v18, v0 offset:3
+        0xD8F00003, 0x13000000, // ds_read_u16 v19, v0 offset:3
+        0xD9340003, 0x00000100, // ds_write_b64 v0, v[1:2] offset:3
+        0xD9380703, 0x00030100, // ds_write2_b64 v0, v[1:2], v[3:4] offset0:3 offset1:7
+        0xD93C0703, 0x00030100, // ds_write2st64_b64 v0, v[1:2], v[3:4]
+        0xD9D80003, 0x14000000, // ds_read_b64 v[20:21], v0 offset:3
+        0xD9DC0703, 0x16000000, // ds_read2_b64 v[22:25], v0
+        0xD9E00703, 0x1A000000, // ds_read2st64_b64 v[26:29], v0
+        0xDA800003, 0x00000100, // ds_write_b8_d16_hi v0, v1 offset:3
+        0xDA840003, 0x00000100, // ds_write_b16_d16_hi v0, v1 offset:3
+        0xDA880003, 0x1E000000, // ds_read_u8_d16 v30, v0 offset:3
+        0xDA8C0003, 0x1F000000, // ds_read_u8_d16_hi v31, v0 offset:3
+        0xDA900003, 0x20000000, // ds_read_i8_d16 v32, v0 offset:3
+        0xDA940003, 0x21000000, // ds_read_i8_d16_hi v33, v0 offset:3
+        0xDA980003, 0x22000000, // ds_read_u16_d16 v34, v0 offset:3
+        0xDA9C0003, 0x23000000, // ds_read_u16_d16_hi v35, v0 offset:3
+        0xDAC00003, 0x00000100, // ds_write_addtid_b32 v1 offset:3
+        0xDAC40003, 0x24000000, // ds_read_addtid_b32 v36 offset:3
         0xBF810000,             // s_endpgm
     ]),
     // s_round_mode / s_denorm_mode write the FP MODE state and must keep
@@ -314,16 +475,23 @@ foreach (var (name, expectTranslate, words) in testPrograms)
         Array.Empty<Gen5ImageBinding>(),
         globalBindings);
 
-    if (Gen5SpirvTranslator.TryCompileVertexShader(state, evaluation, out var vertexShader, out var vertexError))
+    if (!name.StartsWith("lds-", StringComparison.Ordinal))
     {
-        var path = Path.Combine(outputDirectory, $"{name}.spv");
-        File.WriteAllBytes(path, vertexShader.Spirv);
-        Console.WriteLine($"[{name}] emit: success, {vertexShader.Spirv.Length} bytes -> {path}");
-    }
-    else
-    {
-        failures++;
-        Console.WriteLine($"[{name}] emit: FAILED ({vertexError})");
+        if (Gen5SpirvTranslator.TryCompileVertexShader(
+                state,
+                evaluation,
+                out var vertexShader,
+                out var vertexError))
+        {
+            var path = Path.Combine(outputDirectory, $"{name}.spv");
+            File.WriteAllBytes(path, vertexShader.Spirv);
+            Console.WriteLine($"[{name}] emit: success, {vertexShader.Spirv.Length} bytes -> {path}");
+        }
+        else
+        {
+            failures++;
+            Console.WriteLine($"[{name}] emit: FAILED ({vertexError})");
+        }
     }
 
     if (Gen5SpirvTranslator.TryCompileComputeShader(state, evaluation, 1, 1, 1, out var computeShader, out var computeError))

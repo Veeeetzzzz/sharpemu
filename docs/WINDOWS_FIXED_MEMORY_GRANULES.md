@@ -6,19 +6,19 @@ fixed guest mappings can therefore fail if each call asks the host for a new
 reservation: the first call owns the 64 KiB granule and the second call is
 rejected even though its guest pages are still free.
 
-`PhysicalVirtualMemory` reserves each required host-granule range once and
-tracks its allocation base in `_fixedGranuleReservationBases`. Each mapping
-commits only the requested page range, so adjacent `AllocateAt` and
-`TryBackFixedRange` calls can share a reservation without exposing uncommitted
-pages to the guest. Existing tracked regions are also accepted as trusted
-allocation owners.
-
-The fixed-allocation gate serializes reservation ownership and rollback.
-Reservations created by a failed transaction are released, while reservations
-that predate it remain available to adjacent mappings. `Clear` releases both
+`PhysicalVirtualMemory` now reserves each covering host granule once and tracks
+its base in `_fixedGranuleReservationBases`. Each mapping commits only the
+requested page range, so adjacent `AllocateAt` and `TryBackFixedRange` calls can
+share the reservation without exposing uncommitted pages to the guest. The
+fixed-allocation gate is acquired before the region lock, and rollback releases
+only reservations created by the failed transaction. `Clear` releases both
 ordinary regions and shared granule reservations exactly once.
+
+This is the Windows-specific part of upstream PR #748. Its NORMAL-mutex change
+is intentionally not included here: the current branch retains the documented
+Gen5 wrapper compatibility behavior in `KernelPthreadCompatExports`.
 
 Regression coverage is in
 `tests/SharpEmu.Libs.Tests/Memory/GuestMemoryAllocatorTests.cs`; the two granule
-tests run on Windows and the existing fake-host rollback tests cover failed and
-partially occupied ranges.
+tests run on Windows and the existing fake-host rollback tests remain scoped to
+the non-Windows allocation model.

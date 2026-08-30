@@ -362,7 +362,12 @@ public static partial class Gen5MslTranslator
                 DeclareImageKinds();
                 foreach (var instruction in _state.Program.Instructions)
                 {
-                    _usesLds |= instruction.Control is Gen5DataShareControl { Gds: false };
+                    _usesLds |=
+                        instruction.Control is Gen5DataShareControl { Gds: false } &&
+                        instruction.Opcode is not (
+                            "DsSwizzleB32" or
+                            "DsPermuteB32" or
+                            "DsBpermuteB32");
                     _usesFormatLoads |= IsFormatBufferLoad(instruction.Opcode);
                     if (instruction.Control is Gen5InterpolationControl interpolationControl)
                     {
@@ -1229,6 +1234,7 @@ public static partial class Gen5MslTranslator
             {
                 case "SNop":
                 case "SWaitcnt":
+                case "SWaitcntDepctr":
                 case "SInstPrefetch":
                 case "STtraceData":
                 case "SClause":
@@ -1360,13 +1366,31 @@ public static partial class Gen5MslTranslator
                 return false;
             }
 
+            var memoryOpcode = control.UsesFlatAddress
+                ? "Global" + instruction.Opcode["Flat".Length..]
+                : instruction.Opcode;
+            var vectorByteAddress = $"v[{control.VectorAddress}]";
+            if (control.UsesFlatAddress)
+            {
+                if (control.ScalarAddress >= ScalarRegisterFileCount)
+                {
+                    error = "flat-memory address base could not be inferred";
+                    return false;
+                }
+
+                // FLAT carries a complete guest pointer in vaddr:vaddr+1. The
+                // evaluator captures storage rooted at the inferred SGPR pair,
+                // so convert its low dword back to an offset in that binding.
+                vectorByteAddress = $"(v[{control.VectorAddress}] - s[{control.ScalarAddress}])";
+            }
+
             var address = Temp(
                 "uint",
                 ApplyByteBias(
                     bindingIndex,
-                    $"(v[{control.VectorAddress}] + 0x{unchecked((uint)control.OffsetBytes):X}u)"));
+                    $"({vectorByteAddress} + 0x{unchecked((uint)control.OffsetBytes):X}u)"));
             return TryEmitResolvedMemoryAccess(
-                instruction.Opcode,
+                memoryOpcode,
                 bindingIndex,
                 address,
                 control.VectorData,
@@ -1497,6 +1521,16 @@ public static partial class Gen5MslTranslator
                 return false;
             }
 
+            if (instruction.Opcode == "DsSwizzleB32")
+            {
+                return TryEmitDsSwizzle(instruction, control, out error);
+            }
+
+            if (instruction.Opcode is "DsPermuteB32" or "DsBpermuteB32")
+            {
+                return TryEmitDsPermute(instruction, control, out error);
+            }
+
             var ldsMask = _stage == Gen5MslStage.Compute
                 ? LdsDwordMask
                 : PrivateLdsDwordCount - 1;
@@ -1511,8 +1545,70 @@ public static partial class Gen5MslTranslator
                 Line($"if (exec) {{ sharpemu_lds[{index}] = {value}; }}");
             }
 
+            string LoadLdsByte(string address, uint offsetBytes)
+            {
+                var byteAddress = Temp(
+                    "uint",
+                    offsetBytes == 0 ? address : $"({address} + {offsetBytes}u)");
+                return $"((sharpemu_lds[{LdsIndex(byteAddress, 0)}] >> (({byteAddress} & 3u) * 8u)) & 255u)";
+            }
+
+            void StoreLdsByte(string address, uint offsetBytes, string value, uint sourceShift)
+            {
+                var byteAddress = Temp(
+                    "uint",
+                    offsetBytes == 0 ? address : $"({address} + {offsetBytes}u)");
+                var bitShift = Temp("uint", $"({byteAddress} & 3u) * 8u");
+                var fieldMask = Temp("uint", $"255u << {bitShift}");
+                var fieldValue = Temp(
+                    "uint",
+                    $"((({value}) >> {sourceShift}u) & 255u) << {bitShift}");
+                Line("if (exec)");
+                Line("{");
+                _indent++;
+                var pointer = Temp(
+                    "threadgroup atomic_uint*",
+                    $"(threadgroup atomic_uint*)&sharpemu_lds[{LdsIndex(byteAddress, 0)}]");
+                var expected = Temp(
+                    "uint",
+                    $"atomic_load_explicit({pointer}, memory_order_relaxed)");
+                Line("while (true)");
+                Line("{");
+                _indent++;
+                var desired = Temp(
+                    "uint",
+                    $"({expected} & ~{fieldMask}) | {fieldValue}");
+                Line($"if (atomic_compare_exchange_weak_explicit({pointer}, &{expected}, {desired}, memory_order_relaxed, memory_order_relaxed)) {{ break; }}");
+                _indent--;
+                Line("}");
+                _indent--;
+                Line("}");
+            }
+
             switch (instruction.Opcode)
             {
+                case "DsNop":
+                    return true;
+                case "DsWriteAddtidB32":
+                {
+                    var offset = control.Offset0 | (control.Offset1 << 8);
+                    var address = Temp(
+                        "uint",
+                        $"(s[124] & 0xffffu) + {offset}u + (sharpemu_lane * 4u)");
+                    StoreLds(LdsIndex(address, 0), RawSource(instruction, 0));
+                    return true;
+                }
+                case "DsReadAddtidB32":
+                {
+                    var offset = control.Offset0 | (control.Offset1 << 8);
+                    var address = Temp(
+                        "uint",
+                        $"(s[124] & 0xffffu) + {offset}u + (sharpemu_lane * 4u)");
+                    StoreVector(
+                        instruction.Destinations[0].Value,
+                        $"sharpemu_lds[{LdsIndex(address, 0)}]");
+                    return true;
+                }
                 case "DsAddU32":
                 {
                     var address = Temp("uint", RawSource(instruction, 0));
@@ -1529,6 +1625,32 @@ public static partial class Gen5MslTranslator
                 {
                     var address = Temp("uint", RawSource(instruction, 0));
                     StoreLds(LdsIndex(address, control.Offset0), RawSource(instruction, 1));
+                    return true;
+                }
+                case "DsWriteB8":
+                case "DsWriteB16":
+                {
+                    var address = Temp("uint", RawSource(instruction, 0));
+                    var value = Temp("uint", RawSource(instruction, 1));
+                    StoreLdsByte(address, control.Offset0, value, 0);
+                    if (instruction.Opcode == "DsWriteB16")
+                    {
+                        StoreLdsByte(address, control.Offset0 + 1, value, 8);
+                    }
+
+                    return true;
+                }
+                case "DsWriteB8D16Hi":
+                case "DsWriteB16D16Hi":
+                {
+                    var address = Temp("uint", RawSource(instruction, 0));
+                    var value = Temp("uint", RawSource(instruction, 1));
+                    StoreLdsByte(address, control.Offset0, value, 16);
+                    if (instruction.Opcode == "DsWriteB16D16Hi")
+                    {
+                        StoreLdsByte(address, control.Offset0 + 1, value, 24);
+                    }
+
                     return true;
                 }
                 case "DsWriteB64":
@@ -1558,11 +1680,24 @@ public static partial class Gen5MslTranslator
                     var st64 = instruction.Opcode == "DsWrite2St64B32";
                     var address = Temp("uint", RawSource(instruction, 0));
                     StoreLds(
-                        LdsIndex(address, EffectiveDsPairOffsetBytes(control.Offset0, st64)),
+                        LdsIndex(address, EffectiveDsPairOffsetBytes(control.Offset0, sizeof(uint), st64)),
                         RawSource(instruction, 1));
                     StoreLds(
-                        LdsIndex(address, EffectiveDsPairOffsetBytes(control.Offset1, st64)),
+                        LdsIndex(address, EffectiveDsPairOffsetBytes(control.Offset1, sizeof(uint), st64)),
                         RawSource(instruction, 2));
+                    return true;
+                }
+                case "DsWrite2B64":
+                case "DsWrite2St64B64":
+                {
+                    var st64 = instruction.Opcode == "DsWrite2St64B64";
+                    var address = Temp("uint", RawSource(instruction, 0));
+                    var firstOffset = EffectiveDsPairOffsetBytes(control.Offset0, sizeof(ulong), st64);
+                    var secondOffset = EffectiveDsPairOffsetBytes(control.Offset1, sizeof(ulong), st64);
+                    StoreLds(LdsIndex(address, firstOffset), RawSource(instruction, 1));
+                    StoreLds(LdsIndex(address, firstOffset + sizeof(uint)), RawSource(instruction, 2));
+                    StoreLds(LdsIndex(address, secondOffset), RawSource(instruction, 3));
+                    StoreLds(LdsIndex(address, secondOffset + sizeof(uint)), RawSource(instruction, 4));
                     return true;
                 }
                 case "DsReadB32":
@@ -1571,6 +1706,68 @@ public static partial class Gen5MslTranslator
                     StoreVector(
                         instruction.Destinations[0].Value,
                         $"sharpemu_lds[{LdsIndex(address, control.Offset0)}]");
+                    return true;
+                }
+                case "DsReadI8":
+                case "DsReadU8":
+                case "DsReadI16":
+                case "DsReadU16":
+                {
+                    var address = Temp("uint", RawSource(instruction, 0));
+                    var value = Temp("uint", LoadLdsByte(address, control.Offset0));
+                    if (instruction.Opcode.EndsWith("16", StringComparison.Ordinal))
+                    {
+                        value = Temp(
+                            "uint",
+                            $"{value} | ({LoadLdsByte(address, control.Offset0 + 1)} << 8u)");
+                    }
+
+                    var result = instruction.Opcode switch
+                    {
+                        "DsReadI8" => $"uint(int(char({value})))",
+                        "DsReadI16" => $"uint(int(short({value})))",
+                        _ => value,
+                    };
+                    StoreVector(instruction.Destinations[0].Value, result);
+                    return true;
+                }
+                case "DsReadU8D16":
+                case "DsReadU8D16Hi":
+                case "DsReadI8D16":
+                case "DsReadI8D16Hi":
+                case "DsReadU16D16":
+                case "DsReadU16D16Hi":
+                {
+                    var address = Temp("uint", RawSource(instruction, 0));
+                    var value = Temp("uint", LoadLdsByte(address, control.Offset0));
+                    if (instruction.Opcode.StartsWith("DsReadU16", StringComparison.Ordinal))
+                    {
+                        value = Temp(
+                            "uint",
+                            $"{value} | ({LoadLdsByte(address, control.Offset0 + 1)} << 8u)");
+                    }
+                    else if (instruction.Opcode.StartsWith("DsReadI8", StringComparison.Ordinal))
+                    {
+                        value = Temp("uint", $"uint(ushort(short(char({value}))))");
+                    }
+
+                    var destination = instruction.Destinations[0].Value;
+                    var high = instruction.Opcode.EndsWith("Hi", StringComparison.Ordinal);
+                    var result = high
+                        ? $"(v[{destination}] & 0x0000ffffu) | (({value} & 0xffffu) << 16u)"
+                        : $"(v[{destination}] & 0xffff0000u) | ({value} & 0xffffu)";
+                    StoreVector(destination, result);
+                    return true;
+                }
+                case "DsReadB64":
+                {
+                    var address = Temp("uint", RawSource(instruction, 0));
+                    StoreVector(
+                        instruction.Destinations[0].Value,
+                        $"sharpemu_lds[{LdsIndex(address, control.Offset0)}]");
+                    StoreVector(
+                        instruction.Destinations[1].Value,
+                        $"sharpemu_lds[{LdsIndex(address, control.Offset0 + sizeof(uint))}]");
                     return true;
                 }
                 case "DsReadB96":
@@ -1606,20 +1803,307 @@ public static partial class Gen5MslTranslator
                     var address = Temp("uint", RawSource(instruction, 0));
                     StoreVector(
                         instruction.Destinations[0].Value,
-                        $"sharpemu_lds[{LdsIndex(address, EffectiveDsPairOffsetBytes(control.Offset0, st64))}]");
+                        $"sharpemu_lds[{LdsIndex(address, EffectiveDsPairOffsetBytes(control.Offset0, sizeof(uint), st64))}]");
                     StoreVector(
                         instruction.Destinations[1].Value,
-                        $"sharpemu_lds[{LdsIndex(address, EffectiveDsPairOffsetBytes(control.Offset1, st64))}]");
+                        $"sharpemu_lds[{LdsIndex(address, EffectiveDsPairOffsetBytes(control.Offset1, sizeof(uint), st64))}]");
+                    return true;
+                }
+                case "DsRead2B64":
+                case "DsRead2St64B64":
+                {
+                    if (instruction.Destinations.Count < 4)
+                    {
+                        error = "missing LDS read2-b64 operand";
+                        return false;
+                    }
+
+                    var st64 = instruction.Opcode == "DsRead2St64B64";
+                    var address = Temp("uint", RawSource(instruction, 0));
+                    var firstOffset = EffectiveDsPairOffsetBytes(control.Offset0, sizeof(ulong), st64);
+                    var secondOffset = EffectiveDsPairOffsetBytes(control.Offset1, sizeof(ulong), st64);
+                    StoreVector(instruction.Destinations[0].Value, $"sharpemu_lds[{LdsIndex(address, firstOffset)}]");
+                    StoreVector(instruction.Destinations[1].Value, $"sharpemu_lds[{LdsIndex(address, firstOffset + sizeof(uint))}]");
+                    StoreVector(instruction.Destinations[2].Value, $"sharpemu_lds[{LdsIndex(address, secondOffset)}]");
+                    StoreVector(instruction.Destinations[3].Value, $"sharpemu_lds[{LdsIndex(address, secondOffset + sizeof(uint))}]");
                     return true;
                 }
                 default:
+                    if (Gen5ShaderTranslator.IsDataShareAtomic(instruction.Opcode))
+                    {
+                        return TryEmitDataShareAtomic(instruction, control, LdsIndex, out error);
+                    }
+
                     error = $"unsupported LDS opcode {instruction.Opcode}";
                     return false;
             }
         }
 
-        private static uint EffectiveDsPairOffsetBytes(uint offset, bool st64) =>
-            offset * (st64 ? 256u : sizeof(uint));
+        private bool TryEmitDataShareAtomic(
+            Gen5ShaderInstruction instruction,
+            Gen5DataShareControl control,
+            Func<string, uint, string> ldsIndex,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Sources.Count < 2 ||
+                (instruction.Opcode is
+                    "DsCmpstB32" or "DsCmpstRtnB32" or
+                    "DsMskorB32" or "DsMskorRtnB32" &&
+                 instruction.Sources.Count < 3))
+            {
+                error = $"missing LDS atomic operand for {instruction.Opcode}";
+                return false;
+            }
+
+            var address = Temp("uint", RawSource(instruction, 0));
+            var data = Temp("uint", RawSource(instruction, 1));
+            var pointer = $"(threadgroup atomic_uint*)&sharpemu_lds[{ldsIndex(address, control.Offset0)}]";
+
+            Line("if (exec)");
+            Line("{");
+            _indent++;
+
+            string original;
+            if (instruction.Opcode is "DsRsubU32" or
+                "DsMskorB32" or "DsMskorRtnB32")
+            {
+                var second = instruction.Opcode.StartsWith(
+                    "DsMskor",
+                    StringComparison.Ordinal)
+                    ? Temp("uint", RawSource(instruction, 2))
+                    : string.Empty;
+                original = Temp(
+                    "uint",
+                    $"atomic_load_explicit({pointer}, memory_order_relaxed)");
+                Line("while (true)");
+                Line("{");
+                _indent++;
+                var desired = Temp(
+                    "uint",
+                    instruction.Opcode == "DsRsubU32"
+                        ? $"{data} - {original}"
+                        : $"({original} & ~{data}) | {second}");
+                var observed = Temp("uint", original);
+                Line(
+                    $"if (atomic_compare_exchange_weak_explicit({pointer}, &{observed}, {desired}, " +
+                    "memory_order_relaxed, memory_order_relaxed)) { break; }");
+                Line($"{original} = {observed};");
+                _indent--;
+                Line("}");
+            }
+            else if (instruction.Opcode is "DsIncU32" or "DsIncRtnU32" or
+                "DsDecU32" or "DsDecRtnU32")
+            {
+                original = Temp(
+                    "uint",
+                    $"atomic_load_explicit({pointer}, memory_order_relaxed)");
+                Line("while (true)");
+                Line("{");
+                _indent++;
+                var desired = Temp(
+                    "uint",
+                    instruction.Opcode.StartsWith("DsInc", StringComparison.Ordinal)
+                        ? $"({original} >= {data}) ? 0u : ({original} + 1u)"
+                        : $"({original} == 0u || {original} > {data}) ? {data} : ({original} - 1u)");
+                var observed = Temp("uint", original);
+                Line(
+                    $"if (atomic_compare_exchange_weak_explicit({pointer}, &{observed}, {desired}, " +
+                    "memory_order_relaxed, memory_order_relaxed)) { break; }");
+                Line($"{original} = {observed};");
+                _indent--;
+                Line("}");
+            }
+            else if (instruction.Opcode is "DsCmpstB32" or "DsCmpstRtnB32")
+            {
+                var replacement = Temp("uint", RawSource(instruction, 2));
+                original = Temp(
+                    "uint",
+                    $"atomic_load_explicit({pointer}, memory_order_relaxed)");
+                Line($"while ({original} == {data})");
+                Line("{");
+                _indent++;
+                var observed = Temp("uint", original);
+                Line(
+                    $"if (atomic_compare_exchange_weak_explicit({pointer}, &{observed}, {replacement}, " +
+                    "memory_order_relaxed, memory_order_relaxed)) { break; }");
+                Line($"{original} = {observed};");
+                _indent--;
+                Line("}");
+            }
+            else
+            {
+                var (function, signed) = instruction.Opcode switch
+                {
+                    "DsAddU32" or "DsAddRtnU32" => ("atomic_fetch_add_explicit", false),
+                    "DsSubU32" or "DsSubRtnU32" => ("atomic_fetch_sub_explicit", false),
+                    "DsMinI32" or "DsMinRtnI32" => ("atomic_fetch_min_explicit", true),
+                    "DsMaxI32" or "DsMaxRtnI32" => ("atomic_fetch_max_explicit", true),
+                    "DsMinU32" or "DsMinRtnU32" => ("atomic_fetch_min_explicit", false),
+                    "DsMaxU32" or "DsMaxRtnU32" => ("atomic_fetch_max_explicit", false),
+                    "DsAndB32" or "DsAndRtnB32" => ("atomic_fetch_and_explicit", false),
+                    "DsOrB32" or "DsOrRtnB32" => ("atomic_fetch_or_explicit", false),
+                    "DsXorB32" or "DsXorRtnB32" => ("atomic_fetch_xor_explicit", false),
+                    "DsWrxchgRtnB32" => ("atomic_exchange_explicit", false),
+                    _ => (string.Empty, false),
+                };
+                if (function.Length == 0)
+                {
+                    _indent--;
+                    Line("}");
+                    error = $"unsupported LDS opcode {instruction.Opcode}";
+                    return false;
+                }
+
+                original = signed
+                    ? Temp(
+                        "uint",
+                        $"as_type<uint>({function}((threadgroup atomic_int*)&sharpemu_lds[{ldsIndex(address, control.Offset0)}], " +
+                        $"as_type<int>({data}), memory_order_relaxed))")
+                    : Temp(
+                        "uint",
+                        $"{function}({pointer}, {data}, memory_order_relaxed)");
+            }
+
+            if (instruction.Destinations.Count > 0)
+            {
+                Line($"v[{instruction.Destinations[0].Value}] = {original};");
+            }
+
+            _indent--;
+            Line("}");
+            return true;
+        }
+
+        private bool TryEmitDsSwizzle(
+            Gen5ShaderInstruction instruction,
+            Gen5DataShareControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Sources.Count < 1 ||
+                instruction.Destinations.Count < 1)
+            {
+                error = "missing DS swizzle operand";
+                return false;
+            }
+
+            var pattern = control.Offset0 | (control.Offset1 << 8);
+            const string lane = "(sharpemu_lane & 31u)";
+            string targetExpression;
+            if (pattern >= 0xE000)
+            {
+                var mask = pattern & 31u;
+                var bitCount = 0u;
+                for (var remaining = mask; remaining != 0; remaining >>= 1)
+                {
+                    bitCount += remaining & 1u;
+                }
+
+                targetExpression =
+                    $"(((reverse_bits({lane}) >> 27) >> {bitCount}u) | ({lane} & {mask}u))";
+            }
+            else if (pattern >= 0xC000)
+            {
+                var amount = (pattern >> 5) & 31u;
+                var mask = pattern & 31u;
+                var rotate = (pattern & (1u << 10)) != 0
+                    ? $"({lane} - {amount}u)"
+                    : $"({lane} + {amount}u)";
+                targetExpression =
+                    $"(({lane} & {mask}u) | ({rotate} & {(~mask) & 31u}u))";
+            }
+            else if ((pattern & 0x8000) != 0)
+            {
+                targetExpression =
+                    $"(({lane} & 0x1Cu) | (({pattern}u >> (({lane} & 3u) * 2u)) & 3u))";
+            }
+            else
+            {
+                var xorMask = (pattern >> 10) & 31u;
+                var orMask = (pattern >> 5) & 31u;
+                var andMask = pattern & 31u;
+                targetExpression =
+                    $"((({lane} & {andMask}u) | {orMask}u) ^ {xorMask}u)";
+            }
+
+            var target = Temp("uint", $"({targetExpression}) & 31u");
+            var source = Temp("uint", RawSource(instruction, 0));
+            string result;
+            if (IsSingleLaneStage)
+            {
+                result = $"(exec && {target} == 0u) ? {source} : 0u";
+            }
+            else
+            {
+                var shuffled = Temp("uint", ShuffleLane(source, target));
+                var sourceActive = LaneActiveExpression(target);
+                result = $"({sourceActive}) ? {shuffled} : 0u";
+            }
+
+            StoreVector(instruction.Destinations[0].Value, result);
+            return true;
+        }
+
+        private bool TryEmitDsPermute(
+            Gen5ShaderInstruction instruction,
+            Gen5DataShareControl control,
+            out string error)
+        {
+            error = string.Empty;
+            if (instruction.Sources.Count < 2 ||
+                instruction.Destinations.Count < 1)
+            {
+                error = "missing DS permute operand";
+                return false;
+            }
+
+            var offset = control.Offset0 | (control.Offset1 << 8);
+            var address = Temp("uint", RawSource(instruction, 0));
+            var data = Temp("uint", RawSource(instruction, 1));
+            var target = Temp("uint", $"(({address} + {offset}u) >> 2) & 31u");
+            string result;
+            if (IsSingleLaneStage)
+            {
+                result = $"(exec && {target} == 0u) ? {data} : 0u";
+            }
+            else if (instruction.Opcode == "DsBpermuteB32")
+            {
+                var shuffled = Temp("uint", ShuffleLane(data, target));
+                result = $"({LaneActiveExpression(target)}) ? {shuffled} : 0u";
+            }
+            else
+            {
+                var currentLane = "(sharpemu_lane & 31u)";
+                var selected = Temp("uint", "0u");
+                for (uint sourceLane = 0; sourceLane < 32; sourceLane++)
+                {
+                    var candidateTarget = Temp(
+                        "uint",
+                        $"simd_shuffle({target}, (ushort){sourceLane}u)");
+                    var candidateData = Temp(
+                        "uint",
+                        $"simd_shuffle({data}, (ushort){sourceLane}u)");
+                    var candidateActive = Temp(
+                        "bool",
+                        $"simd_shuffle(exec ? 1u : 0u, (ushort){sourceLane}u) != 0u");
+                    selected = Temp(
+                        "uint",
+                        $"({candidateActive} && {candidateTarget} == {currentLane}) ? {candidateData} : {selected}");
+                }
+
+                result = selected;
+            }
+
+            StoreVector(instruction.Destinations[0].Value, result);
+            return true;
+        }
+
+        private static uint EffectiveDsPairOffsetBytes(
+            uint offset,
+            uint elementBytes,
+            bool st64) =>
+            offset * elementBytes * (st64 ? 64u : 1u);
 
         private bool TryEmitResolvedMemoryAccess(
             string opcode,
@@ -1631,21 +2115,97 @@ public static partial class Gen5MslTranslator
             out string error)
         {
             error = string.Empty;
-            if (opcode is "GlobalAtomicAdd" or "BufferAtomicAdd" or
-                "GlobalAtomicUMax" or "BufferAtomicUMax")
+            if (opcode.StartsWith("BufferAtomic", StringComparison.Ordinal) ||
+                opcode.StartsWith("GlobalAtomic", StringComparison.Ordinal))
             {
-                var function = opcode.EndsWith("Add", StringComparison.Ordinal)
-                    ? "atomic_fetch_add_explicit"
-                    : "atomic_fetch_max_explicit";
+                var suffix = opcode.StartsWith("BufferAtomic", StringComparison.Ordinal)
+                    ? opcode["BufferAtomic".Length..]
+                    : opcode["GlobalAtomic".Length..];
                 Line("if (exec)");
                 Line("{");
                 _indent++;
                 Line($"if ({byteAddress} + 4u <= {BufferBytes(bindingIndex)} && ({byteAddress} & 3u) == 0u)");
                 Line("{");
                 _indent++;
-                var original = Temp(
-                    "uint",
-                    $"{function}((device atomic_uint*)(b{bindingIndex} + ({byteAddress} >> 2)), v[{vectorData}], memory_order_relaxed)");
+                var pointer = $"(device atomic_uint*)(b{bindingIndex} + ({byteAddress} >> 2))";
+                var data = Temp("uint", $"v[{vectorData}]");
+                string original;
+                if (suffix is "Inc" or "Dec" or "Csub")
+                {
+                    original = Temp(
+                        "uint",
+                        $"atomic_load_explicit({pointer}, memory_order_relaxed)");
+                    Line("while (true)");
+                    Line("{");
+                    _indent++;
+                    var desiredExpression = suffix switch
+                    {
+                        "Inc" => $"({original} >= {data}) ? 0u : ({original} + 1u)",
+                        "Dec" => $"({original} == 0u || {original} > {data}) ? {data} : ({original} - 1u)",
+                        // GLOBAL_ATOMIC_CSUB saturates an unsigned subtraction at zero.
+                        _ => $"({original} < {data}) ? 0u : ({original} - {data})",
+                    };
+                    var desired = Temp("uint", desiredExpression);
+                    var observed = Temp("uint", original);
+                    Line(
+                        $"if (atomic_compare_exchange_weak_explicit({pointer}, &{observed}, {desired}, " +
+                        "memory_order_relaxed, memory_order_relaxed)) { break; }");
+                    Line($"{original} = {observed};");
+                    _indent--;
+                    Line("}");
+                }
+                else if (suffix == "Cmpswap")
+                {
+                    var comparator = Temp("uint", $"v[{vectorData + 1}]");
+                    original = Temp(
+                        "uint",
+                        $"atomic_load_explicit({pointer}, memory_order_relaxed)");
+                    Line($"while ({original} == {comparator})");
+                    Line("{");
+                    _indent++;
+                    var observed = Temp("uint", original);
+                    Line(
+                        $"if (atomic_compare_exchange_weak_explicit({pointer}, &{observed}, {data}, " +
+                        "memory_order_relaxed, memory_order_relaxed)) { break; }");
+                    Line($"{original} = {observed};");
+                    _indent--;
+                    Line("}");
+                }
+                else
+                {
+                    var (function, signed) = suffix switch
+                    {
+                        "Swap" => ("atomic_exchange_explicit", false),
+                        "Add" => ("atomic_fetch_add_explicit", false),
+                        "Sub" => ("atomic_fetch_sub_explicit", false),
+                        "Smin" => ("atomic_fetch_min_explicit", true),
+                        "Umin" => ("atomic_fetch_min_explicit", false),
+                        "Smax" => ("atomic_fetch_max_explicit", true),
+                        "Umax" => ("atomic_fetch_max_explicit", false),
+                        "And" => ("atomic_fetch_and_explicit", false),
+                        "Or" => ("atomic_fetch_or_explicit", false),
+                        "Xor" => ("atomic_fetch_xor_explicit", false),
+                        _ => (string.Empty, false),
+                    };
+                    if (function.Length == 0)
+                    {
+                        _indent -= 2;
+                        Line("}");
+                        Line("}");
+                        error = $"unsupported buffer opcode {opcode}";
+                        return false;
+                    }
+
+                    original = signed
+                        ? Temp(
+                            "uint",
+                            $"as_type<uint>({function}((device atomic_int*)(b{bindingIndex} + ({byteAddress} >> 2)), " +
+                            $"as_type<int>({data}), memory_order_relaxed))")
+                        : Temp(
+                            "uint",
+                            $"{function}({pointer}, {data}, memory_order_relaxed)");
+                }
+
                 if (glc)
                 {
                     Line($"v[{vectorData}] = {original};");
@@ -1851,26 +2411,26 @@ public static partial class Gen5MslTranslator
             switch (register)
             {
                 case VccLoRegister:
+                case VccHiRegister:
                 {
                     var value = Temp("uint", expression);
-                    Line($"s[{VccLoRegister}] = {value};");
-                    Line($"vcc = (({value}) >> sharpemu_lane & 1u) != 0u;");
+                    Line($"s[{register}] = {value};");
+                    Line(register == VccLoRegister && !IsWave64
+                        ? $"vcc = (({value}) >> sharpemu_lane & 1u) != 0u;"
+                        : $"vcc = {WaveMaskLaneBit(VccLoRegister)};");
                     return;
                 }
 
                 case ExecLoRegister:
+                case ExecHiRegister:
                 {
                     var value = Temp("uint", expression);
-                    Line($"s[{ExecLoRegister}] = {value};");
-                    Line($"exec = (({value}) >> sharpemu_lane & 1u) != 0u;");
+                    Line($"s[{register}] = {value};");
+                    Line(register == ExecLoRegister && !IsWave64
+                        ? $"exec = (({value}) >> sharpemu_lane & 1u) != 0u;"
+                        : $"exec = {WaveMaskLaneBit(ExecLoRegister)};");
                     return;
                 }
-
-                case VccHiRegister:
-                case ExecHiRegister:
-                    // Wave32: the high halves carry no lanes, but keep the data.
-                    Line($"s[{register}] = {expression};");
-                    return;
             }
 
             if (register < ScalarRegisterFileCount)
@@ -1894,6 +2454,51 @@ public static partial class Gen5MslTranslator
             {
                 Line($"v[{register}] = {expression};");
             }
+        }
+
+        private string WaveMaskLaneBit(uint lowRegister) => IsWave64
+            ? $"((sharpemu_lane < 32u ? (s[{lowRegister}] >> sharpemu_lane) : " +
+              $"(s[{lowRegister + 1}] >> (sharpemu_lane - 32u))) & 1u) != 0u"
+            : $"((s[{lowRegister}] >> sharpemu_lane) & 1u) != 0u";
+
+        private string LoadScalarRelative(uint registerBase, string unsignedOffset)
+        {
+            var registerIndex = Temp("uint", $"{registerBase}u + ({unsignedOffset})");
+            return Temp(
+                "uint",
+                $"{registerIndex} < {ScalarRegisterFileCount}u ? s[{registerIndex}] : 0u");
+        }
+
+        private void StoreScalarRelative(
+            uint registerBase,
+            string unsignedOffset,
+            string expression)
+        {
+            var registerIndex = Temp("uint", $"{registerBase}u + ({unsignedOffset})");
+            Line(
+                $"if ({registerIndex} < {ScalarRegisterFileCount}u) " +
+                $"{{ s[{registerIndex}] = {expression}; }}");
+            Line($"vcc = {WaveMaskLaneBit(VccLoRegister)};");
+            Line($"exec = {WaveMaskLaneBit(ExecLoRegister)};");
+        }
+
+        private string LoadVectorRelative(uint registerBase, string unsignedOffset)
+        {
+            var registerIndex = Temp("uint", $"{registerBase}u + ({unsignedOffset})");
+            return Temp(
+                "uint",
+                $"{registerIndex} < {VectorRegisterFileCount}u ? v[{registerIndex}] : 0u");
+        }
+
+        private void StoreVectorRelative(
+            uint registerBase,
+            string unsignedOffset,
+            string expression)
+        {
+            var registerIndex = Temp("uint", $"{registerBase}u + ({unsignedOffset})");
+            Line(
+                $"if (exec && {registerIndex} < {VectorRegisterFileCount}u) " +
+                $"{{ v[{registerIndex}] = {expression}; }}");
         }
 
         private string ScalarExpression(uint register) =>

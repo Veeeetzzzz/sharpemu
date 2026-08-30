@@ -105,8 +105,9 @@ public static class NpTrophy2Exports
         Target = Generation.Gen5,
         LibraryName = "libSceNpTrophy2")]
     public static int NpTrophy2GetTrophyInfoArray(CpuContext ctx) =>
+        // Trophy storage is not implemented yet; NOT_FOUND is the same
+        // contract used by the single-item query and is handled by callers.
         SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
-
 
     private static int WriteIdAndReturn(CpuContext ctx, ulong outAddress, ref int nextId)
     {

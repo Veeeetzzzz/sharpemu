@@ -10,6 +10,32 @@ namespace SharpEmu.Libs.Tests.VideoOut;
 public sealed class VulkanGuestImageAliasTests
 {
     [Theory]
+    [InlineData(Format.R8Srgb, Format.R8Unorm)]
+    [InlineData(Format.R8G8Srgb, Format.R8G8Unorm)]
+    [InlineData(Format.R8G8B8A8Srgb, Format.R8G8B8A8Unorm)]
+    [InlineData(Format.B8G8R8A8Srgb, Format.B8G8R8A8Unorm)]
+    [InlineData(Format.A8B8G8R8SrgbPack32, Format.A8B8G8R8UnormPack32)]
+    public void CompatibleSrgbAndUnormFormatsCanShareAnImageViewClass(
+        Format existing,
+        Format requested)
+    {
+        Assert.True(
+            VulkanVideoPresenter.IsCompatibleGuestImageViewFormat(existing, requested));
+    }
+
+    [Theory]
+    [InlineData(Format.R8Srgb, Format.R8Unorm)]
+    [InlineData(Format.R8G8Srgb, Format.R8G8Unorm)]
+    [InlineData(Format.R8G8B8A8Srgb, Format.R8G8B8A8Unorm)]
+    public void SameStorageCounterpartsCanShareOneGuestImage(
+        Format existing,
+        Format requested)
+    {
+        Assert.True(
+            VulkanVideoPresenter.IsAliasableGuestImageFormat(existing, requested));
+    }
+
+    [Theory]
     [InlineData(Format.R8G8B8A8Srgb, Format.R8G8B8A8Unorm)]
     [InlineData(Format.R8G8B8A8Unorm, Format.R8G8B8A8Srgb)]
     public void SrgbAndUnormCounterpartsShareOneGuestImage(
@@ -58,9 +84,8 @@ public sealed class VulkanGuestImageAliasTests
         Format existing,
         Format requested)
     {
-        // sRGB/UNORM counterparts that the view-compatibility table cannot
-        // alias must keep the recreate path: the shared image could never
-        // legally serve the second identity through an alias view.
+        // Compressed formats remain outside the mutable-image compatibility
+        // table even when their transfer-function counterparts exist.
         Assert.False(
             VulkanVideoPresenter.IsCompatibleGuestImageViewFormat(existing, requested));
         Assert.False(

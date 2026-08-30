@@ -732,6 +732,10 @@ public static class Gen5ShaderTranslator
             0x29 => "SNandSaveexecB64",
             0x2A => "SNorSaveexecB64",
             0x2B => "SXnorSaveexecB64",
+            0x2E => "SMovrelsB32",
+            0x2F => "SMovrelsB64",
+            0x30 => "SMovreldB32",
+            0x31 => "SMovreldB64",
             0x37 => "SAndn1SaveexecB64",
             0x38 => "SOrn1SaveexecB64",
             0x3C => "SAndSaveexecB32",
@@ -915,6 +919,8 @@ public static class Gen5ShaderTranslator
             0x00 => "VNop",
             0x01 => "VMovB32",
             0x02 => "VReadfirstlaneB32",
+            0x03 => "VCvtI32F64",
+            0x04 => "VCvtF64I32",
             0x05 => "VCvtF32I32",
             0x06 => "VCvtF32U32",
             0x07 => "VCvtU32F32",
@@ -924,10 +930,19 @@ public static class Gen5ShaderTranslator
             0x0C => "VCvtRpiI32F32",
             0x0D => "VCvtFlrI32F32",
             0x0E => "VCvtOffF32I4",
+            0x0F => "VCvtF32F64",
+            0x10 => "VCvtF64F32",
             0x11 => "VCvtF32Ubyte0",
             0x12 => "VCvtF32Ubyte1",
             0x13 => "VCvtF32Ubyte2",
             0x14 => "VCvtF32Ubyte3",
+            0x15 => "VCvtU32F64",
+            0x16 => "VCvtF64U32",
+            0x17 => "VTruncF64",
+            0x18 => "VCeilF64",
+            0x19 => "VRndneF64",
+            0x1A => "VFloorF64",
+            0x1B => "VPipeflush",
             0x20 => "VFractF32",
             0x21 => "VTruncF32",
             0x22 => "VCeilF32",
@@ -943,11 +958,42 @@ public static class Gen5ShaderTranslator
             0x36 => "VCosF32",
             0x37 => "VNotB32",
             0x38 => "VBfrevB32",
+            0x39 => "VFfbhU32",
             0x3A => "VFfblB32",
+            0x3B => "VFfbhI32",
+            0x3C => "VFrexpExpI32F64",
+            0x3D => "VFrexpMantF64",
+            0x3E => "VFractF64",
+            0x3F => "VFrexpExpI32F32",
+            0x40 => "VFrexpMantF32",
+            0x41 => "VClrexcp",
             0x42 => "VMovreldB32",
             0x43 => "VMovrelsB32",
             0x44 => "VMovrelsdB32",
             0x48 => "VMovrelsd2B32",
+            0x50 => "VCvtF16U16",
+            0x51 => "VCvtF16I16",
+            0x52 => "VCvtU16F16",
+            0x53 => "VCvtI16F16",
+            0x54 => "VRcpF16",
+            0x55 => "VSqrtF16",
+            0x56 => "VRsqF16",
+            0x57 => "VLogF16",
+            0x58 => "VExpF16",
+            0x59 => "VFrexpMantF16",
+            0x5A => "VFrexpExpI16F16",
+            0x5B => "VFloorF16",
+            0x5C => "VCeilF16",
+            0x5D => "VTruncF16",
+            0x5E => "VRndneF16",
+            0x5F => "VFractF16",
+            0x60 => "VSinF16",
+            0x61 => "VCosF16",
+            0x62 => "VSatPkU8I16",
+            0x63 => "VCvtNormI16F16",
+            0x64 => "VCvtNormU16F16",
+            0x65 => "VSwapB32",
+            0x68 => "VSwaprelB32",
             _ => string.Empty,
         };
 
@@ -968,7 +1014,7 @@ public static class Gen5ShaderTranslator
         }
 
         var src0 = word & 0x1FF;
-        sizeDwords = opcode is 0x20 or 0x21 or 0x2C or 0x2D ||
+        sizeDwords = opcode is 0x20 or 0x21 or 0x2C or 0x2D or 0x37 or 0x38 ||
             src0 is 0xE9 or 0xEA or 0xF9 or 0xFA or 0xFF ? 2u : 1u;
         error = string.Empty;
         name = opcode switch
@@ -978,7 +1024,11 @@ public static class Gen5ShaderTranslator
             0x03 => "VAddF32",
             0x04 => "VSubF32",
             0x05 => "VSubrevF32",
+            0x06 => "VMacLegacyF32",
+            0x07 => "VMulLegacyF32",
             0x08 => "VMulF32",
+            0x09 => "VMulI32I24",
+            0x0A => "VMulHiI32I24",
             0x0B => "VMulU32U24",
             0x0C => "VMulHiU32U24",
             0x0F => "VMinF32",
@@ -1019,8 +1069,13 @@ public static class Gen5ShaderTranslator
             0x33 => "VSubF16",
             0x34 => "VSubrevF16",
             0x35 => "VMulF16",
+            0x36 => "VFmacF16",
+            0x37 => "VFmaMkF16",
+            0x38 => "VFmaAkF16",
             0x39 => "VMaxF16",
             0x3A => "VMinF16",
+            0x3B => "VLdexpF16",
+            0x3C => "VPkFmacF16",
             _ => string.Empty,
         };
 
@@ -1067,6 +1122,38 @@ public static class Gen5ShaderTranslator
             0x1D => "VCmpxNeqF32",
             0x1E => "VCmpxNltF32",
             0x1F => "VCmpxTruF32",
+            0x20 => "VCmpFF64",
+            0x21 => "VCmpLtF64",
+            0x22 => "VCmpEqF64",
+            0x23 => "VCmpLeF64",
+            0x24 => "VCmpGtF64",
+            0x25 => "VCmpLgF64",
+            0x26 => "VCmpGeF64",
+            0x27 => "VCmpOF64",
+            0x28 => "VCmpUF64",
+            0x29 => "VCmpNgeF64",
+            0x2A => "VCmpNlgF64",
+            0x2B => "VCmpNgtF64",
+            0x2C => "VCmpNleF64",
+            0x2D => "VCmpNeqF64",
+            0x2E => "VCmpNltF64",
+            0x2F => "VCmpTruF64",
+            0x30 => "VCmpxFF64",
+            0x31 => "VCmpxLtF64",
+            0x32 => "VCmpxEqF64",
+            0x33 => "VCmpxLeF64",
+            0x34 => "VCmpxGtF64",
+            0x35 => "VCmpxLgF64",
+            0x36 => "VCmpxGeF64",
+            0x37 => "VCmpxOF64",
+            0x38 => "VCmpxUF64",
+            0x39 => "VCmpxNgeF64",
+            0x3A => "VCmpxNlgF64",
+            0x3B => "VCmpxNgtF64",
+            0x3C => "VCmpxNleF64",
+            0x3D => "VCmpxNeqF64",
+            0x3E => "VCmpxNltF64",
+            0x3F => "VCmpxTruF64",
             0x80 => "VCmpFI32",
             0x81 => "VCmpLtI32",
             0x82 => "VCmpEqI32",
@@ -1076,6 +1163,13 @@ public static class Gen5ShaderTranslator
             0x86 => "VCmpGeI32",
             0x87 => "VCmpTI32",
             0x88 => "VCmpClassF32",
+            0x89 => "VCmpLtI16",
+            0x8A => "VCmpEqI16",
+            0x8B => "VCmpLeI16",
+            0x8C => "VCmpGtI16",
+            0x8D => "VCmpNeI16",
+            0x8E => "VCmpGeI16",
+            0x8F => "VCmpClassF16",
             0x90 => "VCmpxFI32",
             0x91 => "VCmpxLtI32",
             0x92 => "VCmpxEqI32",
@@ -1084,6 +1178,57 @@ public static class Gen5ShaderTranslator
             0x95 => "VCmpxNeI32",
             0x96 => "VCmpxGeI32",
             0x97 => "VCmpxTI32",
+            0x99 => "VCmpxLtI16",
+            0x9A => "VCmpxEqI16",
+            0x9B => "VCmpxLeI16",
+            0x9C => "VCmpxGtI16",
+            0x9D => "VCmpxNeI16",
+            0x9E => "VCmpxGeI16",
+            0x9F => "VCmpxClassF16",
+            0xA0 => "VCmpFI64",
+            0xA1 => "VCmpLtI64",
+            0xA2 => "VCmpEqI64",
+            0xA3 => "VCmpLeI64",
+            0xA4 => "VCmpGtI64",
+            0xA5 => "VCmpNeI64",
+            0xA6 => "VCmpGeI64",
+            0xA7 => "VCmpTI64",
+            0xB0 => "VCmpxFI64",
+            0xB1 => "VCmpxLtI64",
+            0xB2 => "VCmpxEqI64",
+            0xB3 => "VCmpxLeI64",
+            0xB4 => "VCmpxGtI64",
+            0xB5 => "VCmpxNeI64",
+            0xB6 => "VCmpxGeI64",
+            0xB7 => "VCmpxTI64",
+            0xA9 => "VCmpLtU16",
+            0xAA => "VCmpEqU16",
+            0xAB => "VCmpLeU16",
+            0xAC => "VCmpGtU16",
+            0xAD => "VCmpNeU16",
+            0xAE => "VCmpGeU16",
+            0xB9 => "VCmpxLtU16",
+            0xBA => "VCmpxEqU16",
+            0xBB => "VCmpxLeU16",
+            0xBC => "VCmpxGtU16",
+            0xBD => "VCmpxNeU16",
+            0xBE => "VCmpxGeU16",
+            0xE0 => "VCmpFU64",
+            0xE1 => "VCmpLtU64",
+            0xE2 => "VCmpEqU64",
+            0xE3 => "VCmpLeU64",
+            0xE4 => "VCmpGtU64",
+            0xE5 => "VCmpNeU64",
+            0xE6 => "VCmpGeU64",
+            0xE7 => "VCmpTU64",
+            0xF0 => "VCmpxFU64",
+            0xF1 => "VCmpxLtU64",
+            0xF2 => "VCmpxEqU64",
+            0xF3 => "VCmpxLeU64",
+            0xF4 => "VCmpxGtU64",
+            0xF5 => "VCmpxNeU64",
+            0xF6 => "VCmpxGeU64",
+            0xF7 => "VCmpxTU64",
             0xC0 => "VCmpFU32",
             0xC1 => "VCmpLtU32",
             0xC2 => "VCmpEqU32",
@@ -1152,6 +1297,24 @@ public static class Gen5ShaderTranslator
         var src2 = (extra >> 18) & 0x1FF;
         sizeDwords = src0 == 0xFF || src1 == 0xFF || src2 == 0xFF ? 3u : 2u;
         error = string.Empty;
+        var compareName = string.Empty;
+        if (!isVop3B && opcode <= byte.MaxValue)
+        {
+            _ = DecodeVopc(
+                opcode << 17,
+                out compareName,
+                out _,
+                out _);
+        }
+        var vop1Name = string.Empty;
+        if (!isVop3B && opcode is >= 0x180 and <= 0x1FF)
+        {
+            _ = DecodeVop1(
+                (opcode - 0x180) << 9,
+                out vop1Name,
+                out _,
+                out _);
+        }
         name = isVop3B
             ? opcode switch
             {
@@ -1162,26 +1325,43 @@ public static class Gen5ShaderTranslator
                 0x176 => "VMadU64U32",
                 _ => $"Vop3bRaw{opcode:X3}",
             }
-            : opcode switch
-        {
-            0x101 => "VCndmaskB32",
+         : opcode switch
+         {
+             0x101 => "VCndmaskB32",
             0x103 => "VAddF32",
-            0x104 => "VSubF32",
-            0x108 => "VMulF32",
+             0x104 => "VSubF32",
+             0x106 => "VMacLegacyF32",
+             0x107 => "VMulLegacyF32",
+             0x108 => "VMulF32",
             0x10F => "VMinF32",
             0x110 => "VMaxF32",
             0x11F => "VMacF32",
             0x12B => "VFmacF32",
             0x12F => "VCvtPkrtzF16F32",
-            0x141 => "VMadF32",
-            0x143 => "VMadU32U24",
+            0x132 => "VAddF16",
+            0x133 => "VSubF16",
+            0x134 => "VSubrevF16",
+            0x135 => "VMulF16",
+            0x136 => "VFmacF16",
+            0x139 => "VMaxF16",
+            0x13A => "VMinF16",
+            0x13B => "VLdexpF16",
+             0x13C => "VPkFmacF16",
+             0x140 => "VMadLegacyF32",
+             0x141 => "VMadF32",
+             0x142 => "VMadI32I24",
+             0x143 => "VMadU32U24",
             0x144 => "VCubeidF32",
             0x145 => "VCubescF32",
             0x146 => "VCubetcF32",
             0x147 => "VCubemaF32",
-            0x14A => "VBfiB32",
-            0x14B => "VFmaF32",
-            0x151 => "VMin3F32",
+             0x14A => "VBfiB32",
+             0x14B => "VFmaF32",
+             0x14D => "VLerpU8",
+             0x14E => "VAlignbitB32",
+             0x14F => "VAlignbyteB32",
+             0x150 => "VMullitF32",
+             0x151 => "VMin3F32",
             0x152 => "VMin3I32",
             0x153 => "VMin3U32",
             0x154 => "VMax3F32",
@@ -1195,12 +1375,33 @@ public static class Gen5ShaderTranslator
             0x15C => "VSadU16",
             0x15D => "VSadU32",
             0x15E => "VCvtPkU8F32",
+            0x200 => "VInterpP1F32",
+            0x201 => "VInterpP2F32",
+            0x202 => "VInterpMovF32",
             0x148 => "VBfeU32",
             0x149 => "VBfeI32",
             0x169 => "VMulLoU32",
             0x16A => "VMulHiU32",
             0x16B => "VMulLoI32",
             0x16C => "VMulHiI32",
+            0x303 => "VAddNcU16",
+            0x304 => "VSubNcU16",
+            0x305 => "VMulLoU16",
+            0x307 => "VLshrrevB16",
+            0x308 => "VAshrrevI16",
+            0x309 => "VMaxU16",
+            0x30A => "VMaxI16",
+            0x30B => "VMinU16",
+            0x30C => "VMinI16",
+            0x30D => "VAddNcI16",
+            0x30E => "VSubNcI16",
+            0x311 => "VPackB32F16",
+            0x312 => "VCvtPknormI16F16",
+            0x313 => "VCvtPknormU16F16",
+            0x314 => "VLshlrevB16",
+            0x340 => "VMadU16",
+            0x342 => "VInterpP1llF16",
+            0x343 => "VInterpP1lvF16",
             0x360 => "VReadlaneB32",
             0x361 => "VWritelaneB32",
             0x362 => "VLdexpF32",
@@ -1212,14 +1413,47 @@ public static class Gen5ShaderTranslator
             0x369 => "VCvtPknormU16F32",
             0x36A => "VCvtPkU16U32",
             0x373 => "VMadU32U16",
+            0x375 => "VMadI32I16",
+            0x344 => "VPermB32",
+            0x345 => "VXadU32",
             0x346 => "VLshlAddU32",
             0x347 => "VAddLshlU32",
+            0x36F => "VLshlOrB32",
+            0x372 => "VOr3B32",
+            0x376 => "VSubNcI32",
+            0x37F => "VAddNcI32",
+            0x34B => "VFmaF16",
+            0x351 => "VMin3F16",
+            0x352 => "VMin3I16",
+            0x353 => "VMin3U16",
+            0x354 => "VMax3F16",
+            0x355 => "VMax3I16",
+            0x356 => "VMax3U16",
+            0x357 => "VMed3F16",
+            0x358 => "VMed3I16",
+            0x359 => "VMed3U16",
+            0x35A => "VInterpP2F16",
+            0x35E => "VMadI16",
+            0x35F => "VDivFixupF16",
             0x36D => "VAdd3U32",
-            0x36F => "VLshlOrU32",
+            // RDNA2 V_MSAD_U8: masked unsigned byte SAD accumulated into S2.
+            0x171 => "VMsadU8",
+            // RDNA2 packed SAD forms write a VGPR pair or quad respectively.
+            0x172 => "VQsadPkU16U8",
+            0x173 => "VMqsadPkU16U8",
+            0x175 => "VMqsadU32U8",
+            // RDNA2 V_DIV_FMAS_F32 conditionally scales a fused multiply-add
+            // by 2^32 when the current lane's VCC bit is set.
+            0x16F => "VDivFmasF32",
             0x371 => "VAndOrB32",
-            0x372 => "VOr3U32",
             0x377 => "VPermlane16B32",
             0x378 => "VPermlanex16B32",
+            0x178 => "VXor3B32",
+            0x2FF => "VLshlrevB64",
+            0x300 => "VLshrrevB64",
+            0x301 => "VAshrrevI64",
+            _ when compareName.Length != 0 => compareName,
+            _ when vop1Name.Length != 0 => vop1Name,
             _ => $"Vop3Raw{opcode:X3}",
         };
 
@@ -1256,19 +1490,40 @@ public static class Gen5ShaderTranslator
         sizeDwords = src0 == 0xFF || src1 == 0xFF || src2 == 0xFF ? 3u : 2u;
         error = string.Empty;
 
-        // Opcode numbers taken from LLVM's AMDGPU VOP3PInstructions.td and the
-        // gfx9/gfx10 MC test encodings; they are unchanged across gfx9 and gfx10.
+        // Opcode numbers taken from AMD's RDNA2 ISA VOP3P table and LLVM's
+        // AMDGPU MC encodings; they are unchanged across gfx9 and gfx10.
         // The mix ops (0x20/0x21/0x22) are V_MAD_MIX_* on gfx9 and V_FMA_MIX_*
         // (fused) on the gfx10 the PS5 targets; both share these opcodes. Any
-        // remaining packed opcode (integer, ...) stays opaque here and fails
-        // loudly at emission rather than being silently mis-emitted.
+        // Remaining packed opcodes stay opaque here and fail loudly at emission
+        // rather than being silently mis-emitted.
         name = opcode switch
         {
+            0x00 => "VPkMadI16",
+            0x01 => "VPkMulLoU16",
+            0x02 => "VPkAddI16",
+            0x03 => "VPkSubI16",
+            0x04 => "VPkLshlrevB16",
+            0x05 => "VPkLshrrevB16",
+            0x06 => "VPkAshrrevI16",
+            0x07 => "VPkMaxI16",
+            0x08 => "VPkMinI16",
+            0x09 => "VPkMadU16",
+            0x0A => "VPkAddU16",
+            0x0B => "VPkSubU16",
+            0x0C => "VPkMaxU16",
+            0x0D => "VPkMinU16",
             0x0E => "VPkFmaF16",
             0x0F => "VPkAddF16",
             0x10 => "VPkMulF16",
             0x11 => "VPkMinF16",
             0x12 => "VPkMaxF16",
+            0x13 => "VDot2F32F16",
+            0x14 => "VDot2I32I16",
+            0x15 => "VDot2U32U16",
+            0x16 => "VDot4I32I8",
+            0x17 => "VDot4U32U8",
+            0x18 => "VDot8I32I4",
+            0x19 => "VDot8U32U4",
             0x20 => "VFmaMixF32",
             0x21 => "VFmaMixloF16",
             0x22 => "VFmaMixhiF16",
@@ -1291,6 +1546,7 @@ public static class Gen5ShaderTranslator
         {
             0x00 => "DsAddU32",
             0x01 => "DsSubU32",
+            0x02 => "DsRsubU32",
             0x03 => "DsIncU32",
             0x04 => "DsDecU32",
             0x05 => "DsMinI32",
@@ -1300,10 +1556,14 @@ public static class Gen5ShaderTranslator
             0x09 => "DsAndB32",
             0x0A => "DsOrB32",
             0x0B => "DsXorB32",
+            0x0C => "DsMskorB32",
             0x0D => "DsWriteB32",
             0x0E => "DsWrite2B32",
             0x0F => "DsWrite2St64B32",
             0x10 => "DsCmpstB32",
+            0x14 => "DsNop",
+            0x1E => "DsWriteB8",
+            0x1F => "DsWriteB16",
             0x20 => "DsAddRtnU32",
             0x21 => "DsSubRtnU32",
             0x23 => "DsIncRtnU32",
@@ -1315,15 +1575,37 @@ public static class Gen5ShaderTranslator
             0x29 => "DsAndRtnB32",
             0x2A => "DsOrRtnB32",
             0x2B => "DsXorRtnB32",
+            0x2C => "DsMskorRtnB32",
             0x2D => "DsWrxchgRtnB32",
             0x30 => "DsCmpstRtnB32",
             0x35 => "DsSwizzleB32",
             0x36 => "DsReadB32",
             0x37 => "DsRead2B32",
             0x38 => "DsRead2St64B32",
+            0x39 => "DsReadI8",
+            0x3A => "DsReadU8",
+            0x3B => "DsReadI16",
+            0x3C => "DsReadU16",
             0x4D => "DsWriteB64",
+            0x4E => "DsWrite2B64",
+            0x4F => "DsWrite2St64B64",
+            0x76 => "DsReadB64",
+            0x77 => "DsRead2B64",
+            0x78 => "DsRead2St64B64",
+            0xA0 => "DsWriteB8D16Hi",
+            0xA1 => "DsWriteB16D16Hi",
+            0xA2 => "DsReadU8D16",
+            0xA3 => "DsReadU8D16Hi",
+            0xA4 => "DsReadI8D16",
+            0xA5 => "DsReadI8D16Hi",
+            0xA6 => "DsReadU16D16",
+            0xA7 => "DsReadU16D16Hi",
+            0xB0 => "DsWriteAddtidB32",
+            0xB1 => "DsReadAddtidB32",
             0xDE => "DsWriteB96",
             0xDF => "DsWriteB128",
+            0xB2 => "DsPermuteB32",
+            0xB3 => "DsBpermuteB32",
             0xFE => "DsReadB96",
             0xFF => "DsReadB128",
             _ => string.Empty,
@@ -1474,8 +1756,20 @@ public static class Gen5ShaderTranslator
             0x23 => "LoadSbyteD16Hi",
             0x24 => "LoadShortD16",
             0x25 => "LoadShortD16Hi",
+            0x30 => "AtomicSwap",
+            0x31 => "AtomicCmpswap",
             0x32 => "AtomicAdd",
-            0x38 => "AtomicUMax",
+            0x33 => "AtomicSub",
+            0x34 => "AtomicCsub",
+            0x35 => "AtomicSmin",
+            0x36 => "AtomicUmin",
+            0x37 => "AtomicSmax",
+            0x38 => "AtomicUmax",
+            0x39 => "AtomicAnd",
+            0x3A => "AtomicOr",
+            0x3B => "AtomicXor",
+            0x3C => "AtomicInc",
+            0x3D => "AtomicDec",
             _ => string.Empty,
         };
         name = prefix.Length != 0 && suffix.Length != 0
@@ -1692,12 +1986,15 @@ public static class Gen5ShaderTranslator
 
     public static bool IsDataShareAtomic(string name) => name switch
     {
-        "DsAddU32" or "DsSubU32" or "DsIncU32" or "DsDecU32" or
+        "DsAddU32" or "DsSubU32" or "DsRsubU32" or
+        "DsIncU32" or "DsDecU32" or
         "DsMinI32" or "DsMaxI32" or "DsMinU32" or "DsMaxU32" or
-        "DsAndB32" or "DsOrB32" or "DsXorB32" or "DsCmpstB32" or
+        "DsAndB32" or "DsOrB32" or "DsXorB32" or
+        "DsMskorB32" or "DsCmpstB32" or
         "DsAddRtnU32" or "DsSubRtnU32" or "DsIncRtnU32" or "DsDecRtnU32" or
         "DsMinRtnI32" or "DsMaxRtnI32" or "DsMinRtnU32" or "DsMaxRtnU32" or
         "DsAndRtnB32" or "DsOrRtnB32" or "DsXorRtnB32" or
+        "DsMskorRtnB32" or
         "DsWrxchgRtnB32" or "DsCmpstRtnB32" => true,
         _ => false,
     };
@@ -1891,6 +2188,13 @@ public static class Gen5ShaderTranslator
                 break;
             }
             case Gen5ShaderEncoding.Vop1:
+                if (opcode is "VPipeflush" or "VClrexcp")
+                {
+                    sources = [];
+                    destinations = [];
+                    break;
+                }
+
                 if (isDpp8)
                 {
                     var extra = words[1];
@@ -1926,6 +2230,17 @@ public static class Gen5ShaderTranslator
                 destinations = opcode == "VReadfirstlaneB32"
                     ? [Gen5Operand.Scalar((word >> 17) & 0x7F)]
                     : [Gen5Operand.Vector((word >> 17) & 0xFF)];
+                if ((opcode is "VSwapB32" or "VSwaprelB32") &&
+                    sources[0].Kind == Gen5OperandKind.VectorRegister)
+                {
+                    var source = sources[0];
+                    var destination = destinations[0];
+                    // Both architectural operands are read before either write.
+                    // Preserve that two-output shape in IR so backends cannot
+                    // accidentally turn the exchange into two sequential moves.
+                    sources = [source, destination];
+                    destinations = [destination, source];
+                }
                 break;
             case Gen5ShaderEncoding.Vop2:
                 if (isDpp8)
@@ -1971,7 +2286,7 @@ public static class Gen5ShaderTranslator
                         Gen5Operand.Source(word & 0x1FF, literal),
                         Gen5Operand.Vector((word >> 9) & 0xFF),
                     ];
-                    if ((opcode is "VMadMkF32" or "VFmaMkF32") && literal.HasValue)
+                    if ((opcode is "VMadMkF32" or "VFmaMkF32" or "VFmaMkF16") && literal.HasValue)
                     {
                         sources =
                         [
@@ -1980,7 +2295,7 @@ public static class Gen5ShaderTranslator
                             sources[1],
                         ];
                     }
-                    else if ((opcode is "VMadAkF32" or "VFmaAkF32") && literal.HasValue)
+                    else if ((opcode is "VMadAkF32" or "VFmaAkF32" or "VFmaAkF16") && literal.HasValue)
                     {
                         sources =
                         [
@@ -2048,13 +2363,54 @@ public static class Gen5ShaderTranslator
             case Gen5ShaderEncoding.Vop3:
             {
                 var extra = words[1];
-                sources =
-                [
-                    Gen5Operand.Source(extra & 0x1FF, literal),
-                    Gen5Operand.Source((extra >> 9) & 0x1FF, literal),
-                    Gen5Operand.Source((extra >> 18) & 0x1FF, literal),
-                ];
-                destinations = [Gen5Operand.Vector(word & 0xFF)];
+                var isCompare = opcode.StartsWith("VCmp", StringComparison.Ordinal);
+                var isInterpolation = opcode.StartsWith("VInterp", StringComparison.Ordinal);
+                if (isInterpolation)
+                {
+                    var attributeWord = extra & 0x1FF;
+                    var source1 = Gen5Operand.Source((extra >> 9) & 0x1FF, literal);
+                    var source2 = Gen5Operand.Source((extra >> 18) & 0x1FF, literal);
+                    sources = opcode is "VInterpP1lvF16" or "VInterpP2F16"
+                        ? [source1, source2]
+                        : [source1];
+                    destinations = [Gen5Operand.Vector(word & 0xFF)];
+                    control = new Gen5InterpolationControl(
+                        Attribute: attributeWord & 0x3F,
+                        Channel: (attributeWord >> 6) & 0x3,
+                        AttributeWordHigh: (attributeWord & 0x100) != 0,
+                        HalfPrecisionResult: opcode == "VInterpP2F16",
+                        DestinationHigh: ((word >> 14) & 1) != 0,
+                        OutputModifier: (extra >> 27) & 0x3,
+                        Clamp: ((word >> 15) & 1) != 0);
+                    break;
+                }
+
+                var vop3Opcode = (word >> 16) & 0x3FF;
+                var isVop1E64 = vop3Opcode is >= 0x180 and <= 0x1FF;
+                sources = opcode is "VPipeflush" or "VClrexcp"
+                    ? []
+                    : isCompare
+                    ?
+                    [
+                        Gen5Operand.Source(extra & 0x1FF, literal),
+                        Gen5Operand.Source((extra >> 9) & 0x1FF, literal),
+                    ]
+                    : isVop1E64
+                    ?
+                    [
+                        Gen5Operand.Source(extra & 0x1FF, literal),
+                    ]
+                    :
+                    [
+                        Gen5Operand.Source(extra & 0x1FF, literal),
+                        Gen5Operand.Source((extra >> 9) & 0x1FF, literal),
+                        Gen5Operand.Source((extra >> 18) & 0x1FF, literal),
+                    ];
+                destinations = opcode is "VPipeflush" or "VClrexcp"
+                    ? []
+                    : isCompare
+                    ? [Gen5Operand.Scalar(word & 0xFF)]
+                    : [Gen5Operand.Vector(word & 0xFF)];
                 if (opcode == "VReadlaneB32")
                 {
                     // V_READLANE uses the VOP3A vdst byte even though the
@@ -2069,7 +2425,9 @@ public static class Gen5ShaderTranslator
                     (extra >> 27) & 0x3,
                     ((word >> 15) & 1) != 0,
                     isVop3B ? 0 : (word >> 11) & 0xF,
-                    isVop3B ? (word >> 8) & 0x7F : null);
+                    isCompare
+                        ? word & 0xFF
+                        : isVop3B ? (word >> 8) & 0x7F : null);
                 break;
             }
             case Gen5ShaderEncoding.Vop3p:
@@ -2083,9 +2441,14 @@ public static class Gen5ShaderTranslator
                 ];
                 destinations = [Gen5Operand.Vector(word & 0xFF)];
 
-                // op_sel_hi is split across both dwords: bits [1:0] live in word1
-                // [28:27], bit [2] in word0 [14].
-                var opSelHi = ((extra >> 27) & 0x3) | (((word >> 14) & 0x1) << 2);
+                // RDNA2 Table 86: high-lane selectors are physically ordered
+                // src0=word0[14], src1=word1[60], src2=word1[59]. Keep the IR
+                // mask ordered by source index; swapping src0/src2 is invisible
+                // for the common [1,1,1] form but misroutes asymmetric shaders.
+                var opSelHi =
+                    ((word >> 14) & 0x1) |
+                    (((extra >> 28) & 0x1) << 1) |
+                    (((extra >> 27) & 0x1) << 2);
                 control = new Gen5Vop3pControl(
                     (word >> 11) & 0x7,
                     opSelHi,
@@ -2107,7 +2470,8 @@ public static class Gen5ShaderTranslator
                     ((word >> 17) & 1) != 0);
                 sources = opcode switch
                 {
-                    "DsWriteB32" => [
+                    "DsWriteB8" or "DsWriteB16" or "DsWriteB32" or
+                    "DsWriteB8D16Hi" or "DsWriteB16D16Hi" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
                     ],
@@ -2134,10 +2498,26 @@ public static class Gen5ShaderTranslator
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Vector(vectorData1),
                     ],
+                    "DsWrite2B64" or "DsWrite2St64B64" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                        Gen5Operand.Vector(vectorData0 + 1),
+                        Gen5Operand.Vector(vectorData1),
+                        Gen5Operand.Vector(vectorData1 + 1),
+                    ],
+                    "DsWriteAddtidB32" => [
+                        Gen5Operand.Vector(vectorData0),
+                    ],
+                    "DsReadAddtidB32" or "DsNop" => [],
                     "DsSwizzleB32" => [Gen5Operand.Vector(vectorData0)],
+                    "DsPermuteB32" or "DsBpermuteB32" => [
+                        Gen5Operand.Vector(vectorAddress),
+                        Gen5Operand.Vector(vectorData0),
+                    ],
                     // DS_CMPST operand order is reversed vs buffer/image cmpswap:
                     // DATA0 holds the comparator, DATA1 holds the new value.
-                    "DsCmpstB32" or "DsCmpstRtnB32" => [
+                    "DsCmpstB32" or "DsCmpstRtnB32" or
+                    "DsMskorB32" or "DsMskorRtnB32" => [
                         Gen5Operand.Vector(vectorAddress),
                         Gen5Operand.Vector(vectorData0),
                         Gen5Operand.Vector(vectorData1),
@@ -2150,12 +2530,29 @@ public static class Gen5ShaderTranslator
                 };
                 destinations = opcode switch
                 {
-                    "DsReadB32" or "DsSwizzleB32" => [
+                    "DsReadB32" or "DsReadI8" or "DsReadU8" or
+                    "DsReadI16" or "DsReadU16" or
+                    "DsReadU8D16" or "DsReadU8D16Hi" or
+                    "DsReadI8D16" or "DsReadI8D16Hi" or
+                    "DsReadU16D16" or "DsReadU16D16Hi" or
+                    "DsReadAddtidB32" or
+                    "DsSwizzleB32" or
+                    "DsPermuteB32" or "DsBpermuteB32" => [
                         Gen5Operand.Vector(vectorDestination),
                     ],
                     "DsRead2B32" or "DsRead2St64B32" => [
                         Gen5Operand.Vector(vectorDestination),
                         Gen5Operand.Vector(vectorDestination + 1),
+                    ],
+                    "DsReadB64" => [
+                        Gen5Operand.Vector(vectorDestination),
+                        Gen5Operand.Vector(vectorDestination + 1),
+                    ],
+                    "DsRead2B64" or "DsRead2St64B64" => [
+                        Gen5Operand.Vector(vectorDestination),
+                        Gen5Operand.Vector(vectorDestination + 1),
+                        Gen5Operand.Vector(vectorDestination + 2),
+                        Gen5Operand.Vector(vectorDestination + 3),
                     ],
                     "DsReadB96" => [
                         Gen5Operand.Vector(vectorDestination),
@@ -2211,9 +2608,10 @@ public static class Gen5ShaderTranslator
                     "GlobalStoreByteD16Hi" or
                     "GlobalStoreShort" or
                     "GlobalStoreShortD16Hi" or
-                    "GlobalStoreDword" or
-                    "GlobalAtomicAdd" or
-                    "GlobalAtomicUMax" => 1u,
+                    "GlobalStoreDword" => 1u,
+                    _ when memoryOpcode.StartsWith(
+                        "GlobalAtomic",
+                        StringComparison.Ordinal) => 1u,
                     "GlobalLoadDword" => 1u,
                     "GlobalLoadDwordx2" => 2u,
                     "GlobalLoadDwordx3" => 3u,
@@ -2589,6 +2987,9 @@ public static class Gen5ShaderTranslator
                 return
                     $"{instruction.Opcode}@0x{instruction.Pc:X}:" +
                     $"attr={interpolation.Attribute},chan={interpolation.Channel}," +
+                    $"wordHi={(interpolation.AttributeWordHigh ? 1 : 0)}," +
+                    $"half={(interpolation.HalfPrecisionResult ? 1 : 0)}," +
+                    $"dstHi={(interpolation.DestinationHigh ? 1 : 0)}," +
                     $"src={instruction.Sources[0]},dst={instruction.Destinations[0]}";
             }
 

@@ -1,27 +1,17 @@
 # Vulkan presentation state
 
-Taking a queued presentation is normally a consumption event even when the
-frame is not submitted to the swapchain. A malformed or empty presentation, an
-oversized staging upload, an uninitialized guest image, or a translated-draw
-setup failure can be dropped after `TryTakePresentation` succeeds. Those paths
-advance the presented sequence so the render loop does not repeatedly revisit
-the same terminal flip and appear stuck on a black screen.
+Taking a queued presentation is a consumption event even when the frame is
+not submitted to the swapchain. A malformed/empty presentation, an oversized
+staging upload, or an uninitialized guest image can be dropped after
+`TryTakePresentation` succeeds. Those paths must still advance the presented
+sequence; otherwise the render loop repeatedly revisits the same dropped flip
+and can appear stuck on a black screen.
 
-The current swapchain paths distinguish work that has not yet been consumed
-from work whose resources have already been released:
+The sequence is intentionally *not* advanced for an acquire timeout or a
+surface-out-of-date result: those paths release the frame resources and retry
+the same presentation after swapchain recovery. This keeps retryable Vulkan
+conditions distinct from terminal presentation drops.
 
-- swapchain recreation before `TryTakePresentation` does not affect the
-  presented sequence;
-- an acquire timeout releases unsubmitted resources but leaves the sequence
-  unchanged;
-- an acquire-time out-of-date result recreates the swapchain, releases the
-  presentation resources, and advances the sequence;
-- an out-of-date result after queue submission also advances the sequence,
-  because the submitted frame is drained during swapchain recreation.
-
-Successful presentation advances the sequence after the frame has been
-submitted and presented. These rules keep terminal drops from spinning while
-preserving the explicit retry behavior of a transient acquire timeout.
-
-The terminal-drop behavior originated in the state-consistency portion of
-upstream PR #747; later swapchain handling extends the same ownership rule.
+This follows the state-consistency portion of upstream
+[#747](https://github.com/sharpemu/sharpemu/pull/747) without importing its
+unrelated renderer changes.

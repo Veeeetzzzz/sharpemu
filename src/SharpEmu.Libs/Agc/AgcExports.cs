@@ -10947,6 +10947,10 @@ private static long _indirectDrawProbeCount;
         out int fallbackTextureCount)
     {
         var textures = new List<GuestDrawTexture>(bindings.Count);
+        // A single translated draw/dispatch can bind the same oversized tiled
+        // surface many times. Share only the immutable source bytes while
+        // retaining one GuestDrawTexture record per binding/view.
+        var sourceCache = new GuestTextureSourceCache();
         fallbackTextureCount = 0;
         foreach (var binding in bindings)
         {
@@ -10959,6 +10963,13 @@ private static long _indirectDrawProbeCount;
                     binding.IsArrayed,
                     out var texture))
             {
+                texture = ShareGuestTextureSource(
+                    sourceCache,
+                    binding.Descriptor,
+                    binding.IsStorage,
+                    binding.MipLevel,
+                    binding.IsArrayed,
+                    texture);
                 textures.Add(texture);
                 if (texture.IsFallback)
                 {
@@ -10968,6 +10979,80 @@ private static long _indirectDrawProbeCount;
         }
 
         return textures;
+    }
+
+    private static GuestDrawTexture ShareGuestTextureSource(
+        GuestTextureSourceCache sourceCache,
+        TextureDescriptor descriptor,
+        bool isStorage,
+        uint mipLevel,
+        bool isArrayed,
+        GuestDrawTexture texture)
+    {
+        var sourceKind = texture.TiledSource is { Length: > 0 }
+            ? GuestTextureSourceKind.TiledBytes
+            : texture.RgbaPixels.Length > 0
+                ? GuestTextureSourceKind.LinearPixels
+                : (GuestTextureSourceKind?)null;
+        if (sourceKind is not { } kind)
+        {
+            return texture;
+        }
+
+        var descriptorIdentity = new GuestTextureSourceDescriptorIdentity(
+            descriptor.Address,
+            descriptor.Width,
+            descriptor.Height,
+            descriptor.Format,
+            descriptor.NumberType,
+            descriptor.TileMode,
+            descriptor.Type,
+            descriptor.BaseLevel,
+            descriptor.LastLevel,
+            descriptor.Pitch,
+            descriptor.DstSelect,
+            descriptor.Depth,
+            descriptor.BaseArray,
+            descriptor.ArrayPitch,
+            descriptor.MaxMip,
+            descriptor.MinLod,
+            descriptor.MinLodWarn,
+            descriptor.BcSwizzle,
+            descriptor.MetadataAddress,
+            descriptor.DescriptorFlags,
+            descriptor.HasExtendedDescriptor);
+        var sourceLength = kind == GuestTextureSourceKind.TiledBytes
+            ? texture.TiledSource!.Length
+            : texture.RgbaPixels.Length;
+        var key = new GuestTextureSourceReuseKey(
+            kind,
+            descriptorIdentity,
+            isStorage,
+            mipLevel,
+            isArrayed,
+            texture.ArrayLayers,
+            texture.Width,
+            texture.Height,
+            texture.Pitch,
+            texture.MipLevels,
+            texture.BaseMipLevel,
+            texture.ResourceMipLevels,
+            texture.Depth,
+            texture.WriteGeneration,
+            sourceLength);
+
+        if (kind == GuestTextureSourceKind.TiledBytes)
+        {
+            var shared = sourceCache.Share(key, texture.TiledSource!);
+            return ReferenceEquals(shared, texture.TiledSource)
+                ? texture
+                : texture with { TiledSource = shared };
+        }
+
+        var sharedPixels = sourceCache.Share(key, texture.RgbaPixels);
+        return ReferenceEquals(sharedPixels, texture.RgbaPixels)
+            ? texture
+            : texture with { RgbaPixels = sharedPixels };
     }
 
     /// <summary>
