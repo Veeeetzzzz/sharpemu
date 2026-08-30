@@ -1704,7 +1704,7 @@ internal static unsafe class VulkanVideoPresenter
                 }
             }
 
-            if (_thread is null)
+            if (ShouldStartPresenter(_closed, _thread is not null))
             {
                 StartPresenterLocked();
             }
@@ -2535,6 +2535,9 @@ internal static unsafe class VulkanVideoPresenter
         };
         _thread.Start();
     }
+
+    internal static bool ShouldStartPresenter(bool closed, bool threadActive) =>
+        !closed && !threadActive;
 
     /// <summary>
     /// Asks a running presenter to close its window; used at emulator
