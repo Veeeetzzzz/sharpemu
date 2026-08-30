@@ -82,4 +82,47 @@ public sealed class VulkanWritebackScanTests
                 absoluteOffset: 0,
                 new List<(int Start, int Length)>()));
     }
+
+    [Fact]
+    public void LiveGuestBytesTriggerRefreshWhenCapturedBytesMatchShadow()
+    {
+        var captured = new byte[] { 1, 2, 3, 4 };
+        var shadow = captured.ToArray();
+        var live = new byte[] { 1, 9, 3, 4 };
+
+        Assert.True(
+            VulkanVideoPresenter.ShouldRefreshGuestBuffer(
+                captured,
+                shadow,
+                live,
+                liveReadSucceeded: true));
+    }
+
+    [Fact]
+    public void EqualLiveGuestBytesDoNotTriggerRefresh()
+    {
+        var captured = new byte[] { 1, 2, 3, 4 };
+        var shadow = captured.ToArray();
+
+        Assert.False(
+            VulkanVideoPresenter.ShouldRefreshGuestBuffer(
+                captured,
+                shadow,
+                shadow,
+                liveReadSucceeded: true));
+    }
+
+    [Fact]
+    public void CapturedDifferenceStillTriggersRefreshWhenLiveReadFails()
+    {
+        var captured = new byte[] { 1, 2, 9, 4 };
+        var shadow = new byte[] { 1, 2, 3, 4 };
+
+        Assert.True(
+            VulkanVideoPresenter.ShouldRefreshGuestBuffer(
+                captured,
+                shadow,
+                Array.Empty<byte>(),
+                liveReadSucceeded: false));
+    }
 }
