@@ -1,13 +1,16 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-using System;
 using System.Buffers.Binary;
 using System.Text;
 using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.Ime;
 
+/// <summary>
+/// Headless libSceImeDialog. Text is committed into the guest-provided UTF-16
+/// buffer; the result structure reports only how the dialog ended.
+/// </summary>
 public static class ImeDialogExports
 {
     private const int StatusNone = 0;
@@ -15,16 +18,50 @@ public static class ImeDialogExports
     private const int StatusFinished = 2;
 
     private const int EndStatusOk = 0;
+    private const int EndStatusUserCanceled = 1;
+    private const int EndStatusAborted = 2;
 
-    private const ulong ParamMaxTextLengthOffset = 0x24;
-    private const ulong ParamInputTextBufferOffset = 0x28;
+    private const int ErrorOk = 0;
+    private const int ErrorInvalidAddress = unchecked((int)0x80BC1001);
+    private const int ErrorInvalidParam = unchecked((int)0x80BC1002);
+    private const int ErrorNotOpened = unchecked((int)0x80BC1003);
+    private const int ErrorNotFinished = unchecked((int)0x80BC1004);
+    private const int ErrorBusy = unchecked((int)0x80BC1005);
 
-    private const int ImeDialogErrorInvalidAddress = unchecked((int)0x80BC0001);
+    private const int ParamSize = 0x60;
+    private const int ParamMaxTextLengthOffset = 0x24;
+    private const int ParamInputTextBufferOffset = 0x28;
+    private const int MaxSupportedTextLength = 1024;
 
-    private const string DefaultInputText = "Sharp";
+    private const string DefaultText = "SharpEmu";
 
-    private static readonly object _gate = new();
-    private static int _status = StatusNone;
+    private static int _status;
+    private static int _endStatus;
+
+    [SysAbiExport(
+        Nid = "aAx4WY4uwLc",
+        ExportName = "sceImeDialogParamInit",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceImeDialog")]
+    public static int ImeDialogParamInit(CpuContext ctx)
+    {
+        var paramAddress = ctx[CpuRegister.Rdi];
+        if (paramAddress == 0)
+        {
+            return ctx.SetReturn(ErrorInvalidAddress);
+        }
+
+        Span<byte> zeroed = stackalloc byte[ParamSize];
+        zeroed.Clear();
+        if (!ctx.Memory.TryWrite(paramAddress, zeroed))
+        {
+            Trace($"param_init param=0x{paramAddress:X12} FAILED (unwritable)");
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        Trace($"param_init param=0x{paramAddress:X12}");
+        return ctx.SetReturn(ErrorOk);
+    }
 
     [SysAbiExport(
         Nid = "NUeBrN7hzf0",
@@ -33,20 +70,65 @@ public static class ImeDialogExports
         LibraryName = "libSceImeDialog")]
     public static int ImeDialogInit(CpuContext ctx)
     {
-        var parameterAddress = ctx[CpuRegister.Rdi];
-        if (parameterAddress == 0)
+        var paramAddress = ctx[CpuRegister.Rdi];
+        if (paramAddress == 0)
         {
-            return SetReturn(ctx, ImeDialogErrorInvalidAddress);
+            Trace("init REJECTED: null param");
+            return ctx.SetReturn(ErrorInvalidAddress);
         }
 
-        TryWriteInputText(ctx, parameterAddress);
-
-        lock (_gate)
+        if (Volatile.Read(ref _status) == StatusRunning)
         {
-            _status = StatusFinished;
+            Trace($"init REJECTED: busy param=0x{paramAddress:X12}");
+            return ctx.SetReturn(ErrorBusy);
         }
 
-        return SetReturn(ctx, 0);
+        Span<byte> param = stackalloc byte[ParamSize];
+        if (!ctx.Memory.TryRead(paramAddress, param))
+        {
+            Trace($"init REJECTED: param=0x{paramAddress:X12} unreadable");
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        var maxTextLength = BinaryPrimitives.ReadUInt32LittleEndian(
+            param[ParamMaxTextLengthOffset..]);
+        var textBuffer = BinaryPrimitives.ReadUInt64LittleEndian(
+            param[ParamInputTextBufferOffset..]);
+        if (textBuffer == 0)
+        {
+            Trace("init REJECTED: inputTextBuffer is null");
+            return ctx.SetReturn(ErrorInvalidParam);
+        }
+
+        var limit = (int)Math.Min(maxTextLength, MaxSupportedTextLength);
+        if (limit == 0)
+        {
+            Trace("init REJECTED: maxTextLength is zero");
+            return ctx.SetReturn(ErrorInvalidParam);
+        }
+
+        // Reserve one UTF-16 code unit for the terminator so the guest buffer
+        // is never overrun even when maxTextLength is a byte/character bound.
+        var text = ResolveText();
+        var capacity = limit - 1;
+        if (text.Length > capacity)
+        {
+            text = text[..capacity];
+        }
+
+        Span<byte> encoded = stackalloc byte[(text.Length + 1) * sizeof(char)];
+        Encoding.Unicode.GetBytes(text, encoded);
+        encoded[^2..].Clear();
+        if (!ctx.Memory.TryWrite(textBuffer, encoded))
+        {
+            Trace($"init REJECTED: inputTextBuffer=0x{textBuffer:X12} unwritable");
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        Volatile.Write(ref _endStatus, EndStatusOk);
+        Volatile.Write(ref _status, StatusRunning);
+        Trace($"init text='{text}' buffer=0x{textBuffer:X16} max={maxTextLength}");
+        return ctx.SetReturn(ErrorOk);
     }
 
     [SysAbiExport(
@@ -56,14 +138,15 @@ public static class ImeDialogExports
         LibraryName = "libSceImeDialog")]
     public static int ImeDialogGetStatus(CpuContext ctx)
     {
-        int status;
-        lock (_gate)
+        // A headless dialog commits immediately once the title polls it.
+        var previous = Interlocked.CompareExchange(ref _status, StatusFinished, StatusRunning);
+        var current = Volatile.Read(ref _status);
+        if (previous != current)
         {
-            status = _status;
+            Trace($"get_status {previous} -> {current}");
         }
 
-        ctx[CpuRegister.Rax] = unchecked((ulong)(long)status);
-        return status;
+        return ctx.SetReturn(current);
     }
 
     [SysAbiExport(
@@ -76,15 +159,26 @@ public static class ImeDialogExports
         var resultAddress = ctx[CpuRegister.Rdi];
         if (resultAddress == 0)
         {
-            return SetReturn(ctx, ImeDialogErrorInvalidAddress);
+            return ctx.SetReturn(ErrorInvalidAddress);
         }
 
-        Span<byte> result = stackalloc byte[8];
-        result.Clear();
-        BinaryPrimitives.WriteInt32LittleEndian(result, EndStatusOk);
-        ctx.Memory.TryWrite(resultAddress, result);
+        if (Volatile.Read(ref _status) != StatusFinished)
+        {
+            Trace($"get_result REJECTED: status={Volatile.Read(ref _status)}");
+            return ctx.SetReturn(ErrorNotFinished);
+        }
 
-        return SetReturn(ctx, 0);
+        // Only endStatus is defined here. Writing an assumed result tail can
+        // overwrite a caller's stack-local guard.
+        Span<byte> endStatus = stackalloc byte[sizeof(int)];
+        BinaryPrimitives.WriteInt32LittleEndian(endStatus, Volatile.Read(ref _endStatus));
+        if (!ctx.Memory.TryWrite(resultAddress, endStatus))
+        {
+            return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT);
+        }
+
+        Trace($"get_result end_status={Volatile.Read(ref _endStatus)}");
+        return ctx.SetReturn(ErrorOk);
     }
 
     [SysAbiExport(
@@ -92,15 +186,14 @@ public static class ImeDialogExports
         ExportName = "sceImeDialogAbort",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceImeDialog")]
-    public static int ImeDialogAbort(CpuContext ctx)
-    {
-        lock (_gate)
-        {
-            _status = StatusFinished;
-        }
+    public static int ImeDialogAbort(CpuContext ctx) => Close(ctx, EndStatusAborted);
 
-        return SetReturn(ctx, 0);
-    }
+    [SysAbiExport(
+        Nid = "bX4H+sxPI-o",
+        ExportName = "sceImeDialogForceClose",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceImeDialog")]
+    public static int ImeDialogForceClose(CpuContext ctx) => Close(ctx, EndStatusUserCanceled);
 
     [SysAbiExport(
         Nid = "gyTyVn+bXMw",
@@ -109,67 +202,49 @@ public static class ImeDialogExports
         LibraryName = "libSceImeDialog")]
     public static int ImeDialogTerm(CpuContext ctx)
     {
-        lock (_gate)
+        if (Interlocked.Exchange(ref _status, StatusNone) == StatusNone)
         {
-            _status = StatusNone;
+            return ctx.SetReturn(ErrorNotOpened);
         }
 
-        return SetReturn(ctx, 0);
+        Trace("term");
+        return ctx.SetReturn(ErrorOk);
     }
 
-    private static void TryWriteInputText(CpuContext ctx, ulong parameterAddress)
+    private static int Close(CpuContext ctx, int endStatus)
     {
-        Span<byte> field = stackalloc byte[8];
-        if (!ctx.Memory.TryRead(parameterAddress + ParamInputTextBufferOffset, field))
+        if (Interlocked.CompareExchange(ref _status, StatusFinished, StatusRunning) != StatusRunning)
+        {
+            return ctx.SetReturn(ErrorNotOpened);
+        }
+
+        Volatile.Write(ref _endStatus, endStatus);
+        Trace($"close end_status={endStatus}");
+        return ctx.SetReturn(ErrorOk);
+    }
+
+    private static string ResolveText()
+    {
+        var configured = Environment.GetEnvironmentVariable("SHARPEMU_IME_TEXT");
+        return string.IsNullOrEmpty(configured) ? DefaultText : configured;
+    }
+
+    internal static void ResetForTests()
+    {
+        Volatile.Write(ref _status, StatusNone);
+        Volatile.Write(ref _endStatus, EndStatusOk);
+    }
+
+    private static void Trace(string message)
+    {
+        if (!string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_LOG_IME_DIALOG"),
+                "1",
+                StringComparison.Ordinal))
         {
             return;
         }
 
-        var bufferAddress = BinaryPrimitives.ReadUInt64LittleEndian(field);
-        if (bufferAddress == 0)
-        {
-            return;
-        }
-
-        var maxTextLength = 16u;
-        Span<byte> lengthField = stackalloc byte[4];
-        if (ctx.Memory.TryRead(parameterAddress + ParamMaxTextLengthOffset, lengthField))
-        {
-            var declared = BinaryPrimitives.ReadUInt32LittleEndian(lengthField);
-            if (declared is > 0 and <= 256)
-            {
-                maxTextLength = declared;
-            }
-        }
-
-        var text = Environment.GetEnvironmentVariable("SHARPEMU_DEFAULT_PROFILE");
-        if (string.IsNullOrEmpty(text))
-        {
-            text = DefaultInputText;
-        }
-
-        if ((uint)text.Length > maxTextLength)
-        {
-            text = text[..(int)maxTextLength];
-        }
-
-        var encoded = Encoding.Unicode.GetBytes(text);
-        Span<byte> payload = stackalloc byte[encoded.Length + 2];
-        encoded.CopyTo(payload);
-        payload[^2] = 0;
-        payload[^1] = 0;
-
-        if (ctx.Memory.TryWrite(bufferAddress, payload))
-        {
-            Console.Error.WriteLine(
-                $"[LOADER][WARN] ime.dialog_autofill buf=0x{bufferAddress:X16} " +
-                $"max={maxTextLength} text=\"{text}\"");
-        }
-    }
-
-    private static int SetReturn(CpuContext ctx, int result)
-    {
-        ctx[CpuRegister.Rax] = unchecked((ulong)(long)result);
-        return result;
+        Console.Error.WriteLine($"[LOADER][TRACE] ime_dialog.{message}");
     }
 }
